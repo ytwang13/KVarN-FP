@@ -164,3 +164,22 @@ solved the KV-size problem, so it rarely pays off. V4-Flash (149GB MoE) would
 be compute/MoE-bound, not KV-bound -> same conclusion expected.
 Caveat: an optimized kernel (KV-splits) would close the 0.39x toward ~1x, but
 not produce a >1x WIN absent a KV-bound regime, which MLA structurally avoids.
+
+## Update 4: kernel v2 (BLOCK_N tiling) + prefill gather + V4-Flash recon
+- Decode kernel rewritten with BLOCK_N=32 token-tiling (was per-token serial).
+  Standalone cos=1.0 vs fp16 ref. Record layout changed to 16-byte-aligned
+  fields (kvarn_mla_layout(): NB, scale@au(NB), zp@+16, rope@+16, REC=au(...))
+  so the gathered fp16 loads vectorize without misaligned-address faults.
+  For V2-Lite (R=512,RP=64): REC=416 (was 388) -> 2.77x vs fp16's 1152.
+- Added _kvarn_mla_gather_dequant_kernel + branch in _compute_prefill_context:
+  unpacks the packed cache into the prefill workspace for chunked prefill
+  (context_lens>0), replacing the C++ gather_and_maybe_dequant_cache that
+  assumed fp8. Validates on long-prompt V2-Lite (chunked) [pending run].
+- V4-Flash recon: it is a SPARSE MLA model (config has index_topk/index_n_heads
+  =64/index_head_dim=128 -> NSA-style sparse attention), with PRE-QUANTIZED
+  weights (quantization_config) and its OWN compression (hc_sinkhorn_iters,
+  compress_ratios). head_dim=512, qk_rope_head_dim=64, num_kv_heads=1, 43 layers,
+  256 experts. Sparse MLA uses SparseMLAAttentionImpl (decode-only forward_mqa),
+  a DIFFERENT impl path than TritonMLAImpl where kvarn_mla is integrated -> V4
+  needs separate sparse-impl integration. And sparse attention reads even fewer
+  KV entries, so the "MLA KV not the bottleneck" conclusion is STRONGER for V4.

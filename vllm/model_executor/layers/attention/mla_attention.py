@@ -976,14 +976,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         head_size = self.head_size
         # KVarN-MLA: the cache stores a PACKED per-token record (uint8), not the
-        # 576 fp16 latent+rope. Record = kv_lora_rank*bits/8 (packed latent) +
-        # 2 (scale) + 2 (zp) + qk_rope_head_dim*2 (fp16 rope). Setting the spec
-        # head_size to this byte count (dtype uint8) sizes the paged cache to the
-        # compressed footprint; compute still uses kv_lora_rank/qk_rope_head_dim.
+        # 576 fp16 latent+rope. Record layout (16-byte-aligned fields so the
+        # decode kernel's gathered fp16 loads vectorize) is computed by
+        # kvarn_mla_layout. Setting the spec head_size to that byte count
+        # (dtype uint8) sizes the paged cache to the compressed footprint;
+        # compute still uses kv_lora_rank/qk_rope_head_dim.
         if str(self.kv_cache_dtype).startswith("kvarn_mla"):
+            from vllm.v1.attention.backends.mla.triton_mla import kvarn_mla_layout
             kv_lora_rank = self.head_size - self.qk_rope_head_dim
-            bits = 4
-            head_size = (kv_lora_rank * bits) // 8 + 2 + 2 + self.qk_rope_head_dim * 2
+            _, _, _, _, head_size = kvarn_mla_layout(
+                kv_lora_rank, self.qk_rope_head_dim, 4)
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -2075,7 +2077,30 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            if not use_fp8_prefill:
+            if getattr(self, "_is_kvarn_mla", False):
+                # KVarN-MLA context gather: unpack the packed cache into the
+                # workspace (the C++ gather_and_maybe_dequant_cache assumes fp8).
+                from vllm.v1.attention.backends.mla.triton_mla import (
+                    _kvarn_mla_gather_dequant_kernel,
+                    kvarn_mla_layout,
+                )
+                NB, SC, ZP, RO, REC = kvarn_mla_layout(
+                    self.kv_lora_rank, self.qk_rope_head_dim, self._kvarn_bits)
+                PAGE = kv_c_and_k_pe_cache.shape[1]
+                ntok = int(prefill_metadata.chunked_context.chunk_total_token[i])
+                bt = prefill_metadata.block_table
+                ws2d = workspace.view(workspace.shape[0], -1)
+                if ntok > 0:
+                    _kvarn_mla_gather_dequant_kernel[(ntok,)](
+                        kv_c_and_k_pe_cache, bt,
+                        prefill_metadata.chunked_context.token_to_seq[i],
+                        prefill_metadata.chunked_context.cu_seq_lens[i],
+                        prefill_metadata.chunked_context.starts[i],
+                        ws2d, bt.stride(0), ws2d.stride(0),
+                        L=self.kv_lora_rank, RP=self.qk_rope_head_dim, NB=NB,
+                        REC=REC, SCALE_OFF=SC, ZP_OFF=ZP, ROPE_OFF=RO, PAGE=PAGE,
+                    )
+            elif not use_fp8_prefill:
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,

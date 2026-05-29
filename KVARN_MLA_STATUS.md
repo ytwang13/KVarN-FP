@@ -141,3 +141,26 @@ Then: correctness vs fp16 on V2-Lite, burst (savings+speed), V4-Flash on 2 GPU.
 EFFORT: store+decode override + numerical-correctness debug + burst + V4 is a
 multi-hour iterative stretch. Everything HARD (3 kernels cos 1.0, savings 2.97x,
 packed cache wired) is DONE; remaining is bounded plumbing on 2 methods.
+
+## Update 3: END-TO-END WORKS + V2-Lite burst (the key result)
+KVarN-MLA runs end-to-end on V2-Lite (fused decode kernel, correct output).
+V2-Lite decode-burst (eager, in=16/out=4096, 32 seqs):
+  FP16:       1756 tok/s, cap 1.71M
+  KVarN-MLA:   691 tok/s, cap 5.08M  => SAVINGS 2.97x (matches theory!), SPEED 0.39x
+Speed 0.39x = (a) v1 kernel unoptimized (per-(batch,head) serial loop, NO
+KV-splits/BLOCK_N) + (b) V2-Lite not KV-bound.
+
+## IMPORTANT CONCLUSION (value assessment)
+MLA's entire purpose is a TINY KV cache (one ~512-dim latent/token, shared
+across heads). So MLA models are essentially NEVER KV-capacity-bound — KV is
+already minuscule vs weights/compute. Therefore KVarN-MLA's ~3x latent savings
+has little to convert into throughput: there is no memory-bound regime to
+exploit, while the in-kernel dequant ADDS per-token cost. Net: on MLA, KVarN
+tends to be slower with capacity that isn't the bottleneck. (Contrast standard
+attention, where KV is large and KVarN's capacity->throughput win is real.)
+This is a feasibility SUCCESS but a VALUE-NEGATIVE result for MLA: the method
+works + quantizes the latent losslessly-ish + 2.97x savings, but MLA already
+solved the KV-size problem, so it rarely pays off. V4-Flash (149GB MoE) would
+be compute/MoE-bound, not KV-bound -> same conclusion expected.
+Caveat: an optimized kernel (KV-splits) would close the 0.39x toward ~1x, but
+not produce a >1x WIN absent a KV-bound regime, which MLA structurally avoids.

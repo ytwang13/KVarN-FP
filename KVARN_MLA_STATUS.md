@@ -199,3 +199,27 @@ not produce a >1x WIN absent a KV-bound regime, which MLA structurally avoids.
     even less. Structurally reinforces the value-negative conclusion for MLA.
   => V4-Flash would need a full sparse-MLA + indexer + compressor kvarn rewrite,
      out of scope. Documented as future work; not attempted further.
+
+## FINAL V2-Lite numbers (best config: BLOCK_N=32)
+| V2-Lite decode-burst, eager, 32 seqs | tok/s | vs FP16 | KV cap | vs FP16 |
+| FP16                                  | 1718  | 1.00x   | 1.71M  | 1.00x   |
+| KVarN-MLA v1 (per-token serial)       |  691  | 0.39x   | 5.08M  | 2.97x   |
+| KVarN-MLA v2 (BLOCK_N=32 tiled)       | 1131  | 0.65x   | 4.74M  | 2.77x   |
+Kernel optimization: 691->1131 tok/s = 1.64x kernel speedup (0.39x->0.65x FP16).
+Capacity dropped 2.97x->2.77x from 16-byte field alignment (REC 388->416); the
+alignment is what lets the v2 gathered fp16 loads vectorize. Net win: +64% speed
+for -7% capacity. Still <1x speed: V2-Lite is not KV-bound (MLA KV already tiny)
++ FP16 path uses the highly-tuned split decode kernel. KV-splits would help
+single-stream latency but not this high-occupancy burst (B*H=512 programs).
+
+## Update 6: V4-Flash is hardware-blocked on this sm_120 box (3 independent reasons)
+Empirical probe results (TP=2, 149GB fp8 weights DID load + sparse backend init'd):
+  1. kv_cache_dtype=auto -> AssertionError "DeepseekV4 only supports fp8 kv-cache
+     format" (V4 hardcodes fp8 KV; kvarn_mla cannot apply without sparse rewrite).
+  2. kv_cache_dtype=fp8 -> ValueError "Mxfp4 MoE backend 'TRITON' does not support
+     the deployment configuration since kernel does not support current device
+     cuda". V4's MoE is MXFP4-quantized; NO MoE backend supports MXFP4 on sm_120.
+  => V4-Flash cannot even load NATIVELY on this Blackwell-consumer box, regardless
+     of KVarN. A V4 kvarn burst here is infeasible (hardware + separate sparse path
+     + hardcoded fp8 KV). Needs a data-center GPU (H100/B200, sm_90/sm_100) AND a
+     sparse-MLA kvarn integration. Documented as future work.

@@ -183,3 +183,19 @@ not produce a >1x WIN absent a KV-bound regime, which MLA structurally avoids.
   a DIFFERENT impl path than TritonMLAImpl where kvarn_mla is integrated -> V4
   needs separate sparse-impl integration. And sparse attention reads even fewer
   KV entries, so the "MLA KV not the bottleneck" conclusion is STRONGER for V4.
+
+## Update 5: BLOCK_N=64 + V4-Flash is a separate sparse path (infeasible target)
+- BLOCK_N sweep at burst shape (B=32,S=4096,H=16): bn16=1832us, bn32=1142,
+  bn64=1048 (best), bn128=2163, bn256=7011. Set decode BLOCK_N=64.
+- Chunked-prefill gather VALIDATED: V2-Lite 1300-tok prompt (3x512 chunks) ->
+  kvarn_mla output IDENTICAL to FP16. Prefill path complete.
+- V4-Flash is NOT a viable kvarn_mla target without major dedicated work:
+  * arch DeepseekV4ForCausalLM uses DeepseekV4SparseMLAAttentionImpl (sparse
+    indexer SparseAttnIndexer + top-k + compressor state cache + flashmla_sparse
+    backend) -- a SEPARATE impl from TritonMLAImpl where kvarn_mla lives.
+  * KV cache is HARDCODED fp8 sparse; config forces kv dtype "deepseek_v4_fp8".
+  * flashmla_sparse backend: sm_120 support doubtful.
+  * Sparse top-k attention reads even FEWER KV entries -> capacity savings matter
+    even less. Structurally reinforces the value-negative conclusion for MLA.
+  => V4-Flash would need a full sparse-MLA + indexer + compressor kvarn rewrite,
+     out of scope. Documented as future work; not attempted further.

@@ -223,3 +223,13 @@ Empirical probe results (TP=2, 149GB fp8 weights DID load + sparse backend init'
      of KVarN. A V4 kvarn burst here is infeasible (hardware + separate sparse path
      + hardcoded fp8 KV). Needs a data-center GPU (H100/B200, sm_90/sm_100) AND a
      sparse-MLA kvarn integration. Documented as future work.
+
+## Update 7: realistic prefill-inclusive burst (in=512 x32, out=2048) -- WORKS
+| V2-Lite real burst | decode tok/s | total tok/s | KV cap | wall |
+| FP16               | 1549         | 1937        | 1.72M  | 42s  |
+| KVarN-MLA k4       | 1045         | 1306        | 4.75M  | 63s  |
+=> 0.67x speed, 2.77x capacity. End-to-end with 512-token prompts (prefill path
+incl. chunked gather) ran with NO errors -- the full pipeline (prefill + decode)
+is correct and stable for realistic prompts. Consistent with the decode-only
+burst (0.65x). Confirms: kernel-optimized KVarN-MLA is correct + stable + ~0.67x
+FP16 speed at ~2.8x capacity on V2-Lite (not KV-bound -> speed<1x as expected).

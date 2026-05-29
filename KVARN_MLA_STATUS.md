@@ -94,3 +94,28 @@ RECOMMENDATION: the honest result is "KVarN-MLA works; ~3x latent compression;
 speed win needs the fused kernel + a memory-bound regime (big MLA model)". For a
 real speed number we'd want a large MLA model on enough GPUs, or accept the
 correctness+savings result on V2-Lite.
+
+## Update: FULL KERNEL SIDE VALIDATED (cos 1.0)
+- Fused MLA-decode w/ in-kernel 4-bit dequant (kvarn_mla_attn_proto.py): cos 1.0.
+- Paged version, shuffled block_table (kvarn_mla_paged_proto.py): cos 1.0.
+  Packed record = [256 latent | 2 scale | 2 zp | 128 rope] = 388 B/token = 2.97x.
+- v1: per-token RTN, NO Hadamard (accuracy refinement to add later).
+
+## Remaining: BACKEND PLUMBING (the integration)
+Crux: decouple cache-record-size (388 B) from compute-dims (kv_lora_rank=512 +
+rope=64). vLLM MLA assumes spec head_size == compute head_size. Plan:
+1. torch_utils: "kvarn_mla_k4_g128" -> torch.uint8 ; cache.py CacheDType.
+2. MLA layer get_kv_cache_spec (mla_attention.py:973): for kvarn_mla_ ->
+   MLAAttentionSpec(head_size=388, dtype=uint8) so page_size = block*388
+   (2.97x more blocks). Keep self.kv_lora_rank/qk_rope_head_dim for compute.
+3. KVarNMLABackend(TritonMLABackend): get_kv_cache_shape -> (nb, block, 388) uint8;
+   get_impl_cls -> KVarNMLAImpl; supported_kv_cache_dtypes += kvarn_mla.
+4. KVarNMLAImpl(TritonMLAImpl): override do_kv_cache_update (per-token RTN ->
+   scatter packed 388-byte records at slot_mapping) + forward_mqa (call the
+   validated paged kernel kvarn_mla_paged_proto). Prefill: use current fp16
+   kv_c (no cache dequant) for single-chunk prompts.
+5. Selection: route kvarn_mla_ -> KVarNMLABackend (cuda.py use_mla list + registry).
+6. Validate V2-Lite end-to-end vs fp16; measure num_gpu_blocks (savings) + tok/s.
+   Then V4-Flash on 2 GPUs (memory-bound -> where savings->speed should show).
+Status: kernels DONE; plumbing = multi-hour iterative integration (head_size
+decouple + store + forward_mqa + spec + selection + V2-Lite debug cycles).

@@ -183,6 +183,19 @@ class KVarNConfig:
         prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
         return max(1, (max_slots - prefill_blocks - 32) // 2)
 
+    def pool_bytes(
+        self,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+        num_kv_heads: int,
+        num_layers: int,
+    ) -> int:
+        """Total GPU bytes the fp16 tail pool occupies (this rank): pool_slots
+        summed over every layer. Reserved up front in the worker so the lazy
+        pool allocation never pushes past the KV-memory limit."""
+        slots = self.pool_slots(max_num_seqs, max_num_batched_tokens)
+        return slots * self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
+
     @staticmethod
     def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
         """First-N + last-N transformer layer indices as strings, suitable

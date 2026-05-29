@@ -41,6 +41,7 @@ class TritonMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "kvarn_mla_k4_g128",
     ]
 
     @classmethod

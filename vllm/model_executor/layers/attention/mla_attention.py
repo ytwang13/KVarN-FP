@@ -974,10 +974,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        head_size = self.head_size
+        # KVarN-MLA: the cache stores a PACKED per-token record (uint8), not the
+        # 576 fp16 latent+rope. Record = kv_lora_rank*bits/8 (packed latent) +
+        # 2 (scale) + 2 (zp) + qk_rope_head_dim*2 (fp16 rope). Setting the spec
+        # head_size to this byte count (dtype uint8) sizes the paged cache to the
+        # compressed footprint; compute still uses kv_lora_rank/qk_rope_head_dim.
+        if str(self.kv_cache_dtype).startswith("kvarn_mla"):
+            kv_lora_rank = self.head_size - self.qk_rope_head_dim
+            bits = 4
+            head_size = (kv_lora_rank * bits) // 8 + 2 + 2 + self.qk_rope_head_dim * 2
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.head_size,
+            head_size=head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
         )

@@ -472,7 +472,7 @@ class Worker(WorkerBase):
         # capped max_num_seqs to this budget, so the reservation is small. Sized
         # per rank (per-rank kv heads) to match the actual allocation.
         cache_dtype = self.cache_config.cache_dtype
-        if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_"):
+        if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_") and not cache_dtype.startswith("kvarn_mla"):
             from vllm.model_executor.layers.quantization.kvarn.config import (
                 KVarNConfig,
             )

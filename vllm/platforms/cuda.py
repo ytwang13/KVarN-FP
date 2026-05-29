@@ -259,6 +259,7 @@ class CudaPlatformBase(Platform):
             model_config is not None
             and isinstance(cache_dtype, str)
             and cache_dtype.startswith("kvarn_")
+            and not cache_dtype.startswith("kvarn_mla")  # MLA path: separate machinery
         ):
             from vllm.model_executor.layers.quantization.kvarn.config import (
                 KVarNConfig,

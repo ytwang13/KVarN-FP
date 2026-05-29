@@ -264,6 +264,21 @@ class CudaPlatformBase(Platform):
                 KVarNConfig,
             )
 
+            # KVarN is a full-attention KV quantizer; its decode path does not
+            # implement a sliding-window mask. Keep sliding-window layers in the
+            # default (full-precision) dtype so hybrid / SWA models (Gemma,
+            # Mistral, gpt-oss, ...) stay correct — KVarN compresses only the
+            # full-attention layers. This is a no-op for full-attention models.
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            if "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+                logger.info(
+                    "KVarN (%s): sliding-window attention layers (if any) are "
+                    "kept in full precision; KVarN compresses full-attention "
+                    "layers only.",
+                    cache_dtype,
+                )
+
             kvarn_cfg = KVarNConfig.from_cache_dtype(
                 cache_dtype, model_config.get_head_size()
             )

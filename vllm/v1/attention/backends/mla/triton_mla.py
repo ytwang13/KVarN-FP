@@ -333,7 +333,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             bid = block_ids[i]
             off = offsets[i]
             st = stage.get(bid)
-            if st is None:
+            # offset 0 = a freshly (re)allocated block. vLLM reuses physical
+            # block ids across finished requests, so a stale staging entry here
+            # would contaminate a new sequence -> always start fresh at offset 0.
+            if st is None or off == 0:
                 st = {
                     "lat": torch.zeros(G, R, dtype=torch.float16, device=lat.device),
                     "rope": torch.zeros(G, ROPE, dtype=torch.float16, device=lat.device),

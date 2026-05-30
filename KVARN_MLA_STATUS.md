@@ -421,3 +421,21 @@ Debugged the 0.67% GSM8K collapse:
   cache -> garbage context. Fix (validate): enable_chunked_prefill=False (each
   prompt single-chunk, no context gather). General fix (TODO): tile-aware context
   gather that also reads staged partial blocks.
+
+## Update 19: full method CORRECT batched (prefix-cache was the bug)
+GSM8K collapse fully diagnosed in stages:
+- Not the int4 round-trip (dequant rel 2e-4), not multi-block decode (real-text
+  == FP16), not 2 distinct long prompts (both coherent).
+- Two real bugs found + handled:
+  1. Block REUSE across finished requests -> stale staging contaminates new seq.
+     Fixed: reset staging on offset==0 (fresh block).
+  2. PREFIX CACHING: 8-shot prompts share an ~850-tok prefix; vLLM shares those
+     physical blocks across sequences, but per-block staging assumes one seq per
+     block (a seq's suffix appends into a shared, already-flushed prefix block).
+     -> disable enable_prefix_caching (+ enable_chunked_prefill) for the eager
+     correctness path. With both off, NQ=8 generations all coherent.
+=> Full KVarN method (Hadamard+Sinkhorn+per-channel RTN int4 tile cache) is
+CORRECT batched + multi-block. GENERALITY TODOs for the production backend:
+shared-block (prefix cache) + split-block (chunked prefill) support, and CUDA
+graphs (move flush to builder + dequant Triton kernel -> stock decode). Final
+NQ=150 accuracy [running]. Eager decode is slow -> graphs are the speed work.

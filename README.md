@@ -37,12 +37,6 @@ matches FP16 accuracy *and* throughput while delivering ~4× the KV-cache capaci
   <img src="imgs/pareto_qwen3-32b.png" alt="KVarN vs FP16 vs TurboQuant: accuracy, throughput and capacity" width="660">
 </p>
 
-| backend | accuracy (AIME25) | burst throughput (vs FP16) | KV-cache capacity (vs FP16) |
-|---|---|---|---|
-| FP16 | 59.4% | 1.00× | 1.0× |
-| TurboQuant 3-bit | 52.7% | 0.44× | 4.01× |
-| **KVarN** | **59.3%** | **1.07×** | **4.06×** |
-
 KVarN stays in the upper-right corner the blog's methods can't reach: **FP16-level
 accuracy, FP16-or-better throughput, and several times the context.**
 

@@ -105,6 +105,19 @@ bit-widths are fully parameterized internally, so other presets are easy to add.
 
 ---
 
+## Citation
+
+KVarN is the official vLLM implementation of our paper, which describes the method
+and the full set of benchmarks.
+
+> 📄 **Paper:** available on arXiv soon (link will be added here).
+
+<!-- TODO: replace with the arXiv URL + BibTeX once the paper is public:
+> 📄 **Paper:** [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX)
+-->
+
+---
+
 ## License and attribution
 
 KVarN is built on [vLLM](https://github.com/vllm-project/vllm) (v0.22.0) and is

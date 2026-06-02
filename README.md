@@ -6,7 +6,7 @@
 
 
 <p align="center">
-  <img src="imgs/logo_600.png" alt="KVarN" width="520">
+  <img src="imgs/logo_600.png" alt="KVarN" width="640">
 </p>
 
 <h3 align="center">Variance-Normalized KV-Cache Quantization for vLLM</h3>

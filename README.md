@@ -16,7 +16,7 @@
 
 > 🔌 **Calibration-free, plug-and-play with vLLM.** A native vLLM attention backend: add one flag, no model changes, no calibration.
 
-> 🥊 **Up to ~2.4× TurboQuant throughput**, same capacity, higher (FP16-level) accuracy.
+> 🥊 **Up to ~2.4× TurboQuant throughput**, same capacity, **higher accuracy**.
 
 ---
 

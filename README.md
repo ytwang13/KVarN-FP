@@ -102,7 +102,7 @@ through the four stages above:
 The shipped preset spends **more bits on keys than values** (`kvarn_k4v2_g128`:
 4-bit keys, 2-bit values). We chose to release this configuration because it meets
 the strictest accuracy bar, matching FP16, that the most demanding production
-deployments and vLLM require, while still delivering up to ~1.3x FP16 throughput. The
+deployments and vLLM require, while still delivering throughput above FP16. The
 bit-widths are fully parameterized internally, so other presets are easy to add.
 
 ---

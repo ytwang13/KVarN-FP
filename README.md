@@ -1,6 +1,6 @@
 [![Built on vLLM](https://img.shields.io/badge/Built%20on-vLLM%20v0.22.0-30a14e)](https://github.com/vllm-project/vllm)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)](#citation)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.03458-b31b1b.svg)](https://arxiv.org/abs/2606.03458)
 [![hf-space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Huawei%20CSL-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/huawei-csl)
 [![GitHub stars](https://img.shields.io/github/stars/huawei-csl/KVarN?label=Stars&logo=github&logoColor=white&style=flat-square)](https://github.com/huawei-csl/KVarN/stargazers)
 
@@ -57,7 +57,7 @@ from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="Qwen/Qwen3-32B",
-    dtype="float16",                    # KVarN currently runs in float16
+    dtype="float16",                    # KVarN runs in float16
     kv_cache_dtype="kvarn_k4v2_g128",   # enable KVarN
     block_size=128,                     # KVarN tile size
 )
@@ -71,9 +71,8 @@ Serving works the same way:
 vllm serve Qwen/Qwen3-32B --dtype float16 --kv-cache-dtype kvarn_k4v2_g128 --block-size 128
 ```
 
-> **Note:** KVarN currently runs in `float16` compute (bf16 support is coming),
-> and the tile / page size is fixed at 128 (one vLLM block = one KVarN tile).
-> Support for bf16 and other page sizes is coming soon.
+> **Note:** KVarN runs in `float16` compute. The tile / page size is currently
+> fixed at 128 (one vLLM block = one KVarN tile); other page sizes are coming soon.
 
 ---
 
@@ -113,11 +112,7 @@ bit-widths are fully parameterized internally, so other presets are easy to add.
 KVarN is the official vLLM implementation of our paper, which describes the method
 and the full set of benchmarks.
 
-> 📄 **Paper:** available on arXiv soon (link will be added here).
-
-<!-- TODO: replace with the arXiv URL + BibTeX once the paper is public:
-> 📄 **Paper:** [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX)
--->
+> 📄 **Paper:** [arXiv:2606.03458](https://arxiv.org/abs/2606.03458)
 
 ---
 

@@ -22,6 +22,11 @@
 
 ## Why KVarN?
 
+> **kvarn** /kvɑːɳ/ &nbsp;·&nbsp; *noun* (Swedish)
+>
+> 1. A grinding apparatus used to reduce substances into smaller particles or
+>    powder, especially grains, seeds, spices, coffee beans, KV-caches.
+
 KV-cache quantization usually comes with a catch. As the
 [vLLM TurboQuant blog](https://vllm.ai/blog/2026-05-11-turboquant) shows, existing
 methods buy extra KV-cache capacity but **give up throughput** (TurboQuant reports
@@ -38,11 +43,6 @@ matches FP16 accuracy and **beats its throughput** while delivering ~4× the KV-
 
 KVarN stays in the upper-right corner the blog's methods can't reach: **FP16-level
 accuracy, FP16-or-better throughput, and several times the context.**
-
-> 📖 **kvarn** /kvɑːɳ/ &nbsp;·&nbsp; *noun* (Swedish)
->
-> 1. A grinding apparatus used to reduce substances into smaller particles or
->    powder, especially grains, seeds, spices, coffee beans, KV-caches.
 
 ---
 

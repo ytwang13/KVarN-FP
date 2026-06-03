@@ -39,6 +39,11 @@ matches FP16 accuracy and **beats its throughput** while delivering ~4× the KV-
 KVarN stays in the upper-right corner the blog's methods can't reach: **FP16-level
 accuracy, FP16-or-better throughput, and several times the context.**
 
+> 📖 **kvarn** /kvɑːɳ/ &nbsp;·&nbsp; *noun* (Swedish)
+>
+> 1. A grinding apparatus used to reduce substances into smaller particles or
+>    powder, especially grains, seeds, spices, coffee beans, KV-caches.
+
 ---
 
 ## Quickstart

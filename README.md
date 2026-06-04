@@ -81,6 +81,13 @@ vllm serve Qwen/Qwen3-32B --dtype float16 --kv-cache-dtype kvarn_k4v2_g128 --blo
 > **Note:** KVarN runs in `float16` compute. The tile / page size is currently
 > fixed at 128 (one vLLM block = one KVarN tile); other page sizes are coming soon.
 
+> **Tip (capacity):** KVarN realizes its full KV-cache capacity when there is room
+> to amortize a small fixed decode workspace. On multi-GPU or generous
+> `--gpu-memory-utilization` setups this is automatic. On a tight single-GPU budget,
+> vLLM's CUDA-graph memory profiler can over-reserve and shrink the KV pool; set
+> `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` (and/or raise
+> `--gpu-memory-utilization`) to recover the full capacity.
+
 ---
 
 ## How does KVarN work?

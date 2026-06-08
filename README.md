@@ -102,7 +102,7 @@ vllm serve zai-org/GLM-4.7-Flash \
     --tensor-parallel-size 2
 ```
 
-**GLM-4.7-Flash, KVarN vs bf16** (2× Blackwell, TP=2, CUDA graphs):
+**GLM-4.7-Flash, KVarN vs bf16** (TP=2):
 
 | Metric | bf16 | KVarN | KVarN / bf16 |
 | --- | --- | --- | --- |

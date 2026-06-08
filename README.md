@@ -88,7 +88,7 @@ vllm serve Qwen/Qwen3-32B --dtype float16 --kv-cache-dtype kvarn_k4v2_g128 --blo
 > `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` (and/or raise
 > `--gpu-memory-utilization`) to recover the full capacity.
 
-### MLA models (e.g. GLM-4.7-Flash)
+### MLA models
 
 KVarN also supports **Multi-head Latent Attention (MLA)**. To the best of our knowledge, **KVarN is the first sub-8-bit KV-cache quantization method in vLLM to support MLA-based models**: it quantizes the compressed KV latent to int4. Use the **same** `--kv-cache-dtype` you use on
 dense models; on an MLA model it automatically routes to the MLA latent path (no

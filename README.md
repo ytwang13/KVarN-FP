@@ -105,7 +105,7 @@ vllm serve zai-org/GLM-4.7-Flash \
 
 | Metric | bf16 | KVarN | KVarN / bf16 |
 | --- | --- | --- | --- |
-| Burst throughput @32K (tok/s) | 401 | 364 | **0.94×** |
+| Burst throughput @32K (tok/s) | 401 | 377 | **0.94×** |
 | KV-cache capacity (tokens) | 313K | 865K | **2.77×** |
 | AIME25 accuracy | 53.3% | **53.3%** | parity |
 

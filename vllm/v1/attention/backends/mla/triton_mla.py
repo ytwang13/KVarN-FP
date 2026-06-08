@@ -1089,7 +1089,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             warps = int(os.environ.get("KVARN_MLA_WARPS", "8"))
             stages = int(os.environ.get("KVARN_MLA_STAGES", "2"))
             # Split-K count (fixed at capture for graphs). Auto-scale with the
-            # model's max context: 16 was tuned at <=8K (sm_120: +3.6% short-ctx,
+            # model's max context: 16 was tuned at <=8K (+3.6% short-ctx,
             # +8% @8K vs 4), but at 16K (128 blocks) low-batch decode
             # under-parallelizes -> bump to 32 (burst@16K B8: 0.82x -> 0.90x vs
             # bf16; 64 gives no further gain). Targets ~4 blocks/split at max ctx.

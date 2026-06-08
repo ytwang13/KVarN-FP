@@ -90,7 +90,7 @@ vllm serve Qwen/Qwen3-32B --dtype float16 --kv-cache-dtype kvarn_k4v2_g128 --blo
 
 ### MLA models
 
-KVarN also supports **Multi-head Latent Attention (MLA)**. To the best of our knowledge, **KVarN is the first sub-8-bit KV-cache quantization method in vLLM to support MLA-based models**: it quantizes the compressed KV latent to int4. Use the **same** `--kv-cache-dtype` you use on
+KVarN also supports **Multi-head Latent Attention (MLA)**. To the best of our knowledge, **KVarN is the first vLLM-compatible sub-8-bit KV-cache quantization method to support MLA-based models**: it quantizes the compressed KV latent to int4. Use the **same** `--kv-cache-dtype` you use on
 dense models; on an MLA model it automatically routes to the MLA latent path (no
 code or env changes), and the fast path is on by default:
 

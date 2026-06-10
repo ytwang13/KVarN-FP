@@ -488,11 +488,14 @@ class Worker(WorkerBase):
             kvarn_cfg = KVarNConfig.from_cache_dtype(
                 cache_dtype, model_config.get_head_size()
             )
+            # Pool spans only the full-attention layers KVarN quantizes, not the
+            # Mamba/linear-attention layers of a hybrid model — sizing by all
+            # layers would over-reserve it ~Nx on a hybrid. Dense path unchanged.
             pool_bytes = kvarn_cfg.pool_bytes(
                 max_num_seqs=sched.max_num_seqs,
                 max_num_batched_tokens=sched.max_num_batched_tokens,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                num_layers=model_config.get_num_layers(parallel_config),
+                num_layers=KVarNConfig.num_kvarn_layers(model_config, parallel_config),
             )
             self.available_kv_cache_memory_bytes -= pool_bytes
             logger.info_once(

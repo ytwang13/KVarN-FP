@@ -320,10 +320,17 @@ class CudaPlatformBase(Platform):
                 model_config.model,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
             )
+            # The fp16 tail pool exists ONLY for the full-attention layers KVarN
+            # quantizes — NOT the Mamba/linear-attention layers of a hybrid model
+            # (Qwen3.5/3.6, Jamba, ...). Sizing the pool by all layers would
+            # over-reserve it ~Nx on a hybrid (starving the Mamba/KV caches -> OOM
+            # or cap collapse). Use the attention-layer count; for a dense model
+            # this equals total layers, so the dense path is unchanged.
+            kvarn_layers = KVarNConfig.num_kvarn_layers(model_config, parallel_config)
             supported = kvarn_cfg.max_supported_seqs(
                 total_gpu_bytes=total_gpu_bytes,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                num_layers=model_config.get_num_layers(parallel_config),
+                num_layers=kvarn_layers,
                 max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
                 gpu_memory_utilization=cache_config.gpu_memory_utilization,
                 weight_bytes=weight_bytes,

@@ -112,33 +112,58 @@ def _kvarn_mla_decode_kernel(
 
 @triton.jit
 def _kvarn_mla_gather_dequant_kernel(
-    Cache, BlockTable, TokenToSeq, CuSeqLens, SeqStarts, Dst,
+    Cache, BlockTable, TokenToSeq, CuSeqLens, SeqStarts,
+    B2S, PoolLat, PoolRope, Dst,
     stride_bt, stride_dst,
-    L: tl.constexpr, RP: tl.constexpr, NB: tl.constexpr, REC: tl.constexpr,
-    SCALE_OFF: tl.constexpr, ZP_OFF: tl.constexpr, ROPE_OFF: tl.constexpr,
-    PAGE: tl.constexpr,
+    stride_pl_b, stride_pl_t, stride_pr_b, stride_pr_t,
+    L: tl.constexpr, RP: tl.constexpr, G: tl.constexpr, REC: tl.constexpr,
+    SC_OFF: tl.constexpr, ZP_OFF: tl.constexpr, SR_OFF: tl.constexpr,
+    RP_OFF: tl.constexpr, NUM_BLOCKS_LOOKUP: tl.constexpr,
 ):
-    """Chunked-prefill context gather for KVarN-MLA: grid (num_tokens,). For each
-    context token, maps logical position -> physical slot via the block_table,
-    dequants the packed latent (4-bit + scale/zp) and copies fp16 RoPE into the
-    prefill workspace [num_tokens, L+RP] in model dtype. Replaces the C++
-    gather_and_maybe_dequant_cache, which assumes an fp8 cache dtype."""
+    """Context gather for KVarN-MLA prefill (chunked prefill and prefix-cache
+    hits): grid (num_tokens,). For each cached context token, read the ROTATED
+    fp16 latent + rope from the tail pool (unflushed block, slot >= 0 in the
+    block->slot lookup) or dequant it from the per-block int4 TILE record
+    (flushed block: token-major packed latent, per-channel scale/zp, per-token
+    s_row — same layout the tile decode kernel reads), and write
+    ``[lat_rot, rope]`` to the prefill workspace row. The caller un-rotates the
+    latent (one batched matmul by H^T) to recover ``kv_c_normed``. Replaces the
+    old gather, which read the tile cache with the legacy PER-TOKEN record
+    layout — wrong format for the tile method — and knew nothing of the pool."""
     t = tl.program_id(0)
     seq = tl.load(TokenToSeq + t)
     pos = t - tl.load(CuSeqLens + seq) + tl.load(SeqStarts + seq)
-    phys = tl.load(BlockTable + seq * stride_bt + pos // PAGE)
-    base = (phys * PAGE + pos % PAGE) * REC
-    offs_p = tl.arange(0, NB)
+    phys = tl.load(BlockTable + seq * stride_bt + pos // G)
+    intra = (pos % G).to(tl.int64)
+    offs_l = tl.arange(0, L)
     offs_r = tl.arange(0, RP)
-    b = tl.load(Cache + base + offs_p).to(tl.uint32)
-    sc = tl.load((Cache + base + SCALE_OFF).to(tl.pointer_type(tl.float16))).to(tl.float32)
-    zp = tl.load((Cache + base + ZP_OFF).to(tl.pointer_type(tl.float16))).to(tl.float32)
-    lat = tl.interleave((b & 0xF).to(tl.float32) * sc + zp,
-                        ((b >> 4) & 0xF).to(tl.float32) * sc + zp)
-    rp = tl.load((Cache + base + ROPE_OFF).to(tl.pointer_type(tl.float16)) + offs_r).to(tl.float32)
     dbase = Dst + t * stride_dst
-    tl.store(dbase + tl.arange(0, L), lat.to(Dst.dtype.element_ty))
-    tl.store(dbase + L + offs_r, rp.to(Dst.dtype.element_ty))
+    in_range = (phys >= 0) & (phys < NUM_BLOCKS_LOOKUP)
+    slot = tl.load(B2S + phys, mask=in_range, other=-1)
+    if slot >= 0:
+        lat = tl.load(PoolLat + slot.to(tl.int64) * stride_pl_b
+                      + intra * stride_pl_t + offs_l).to(tl.float32)
+        rope = tl.load(PoolRope + slot.to(tl.int64) * stride_pr_b
+                       + intra * stride_pr_t + offs_r).to(tl.float32)
+        tl.store(dbase + offs_l, lat.to(Dst.dtype.element_ty))
+        tl.store(dbase + L + offs_r, rope.to(Dst.dtype.element_ty))
+    else:
+        base = phys.to(tl.int64) * REC
+        pk = tl.load(Cache + base + intra * (L // 2)
+                     + tl.arange(0, L // 2)).to(tl.uint32)
+        sc = tl.load((Cache + base + SC_OFF).to(tl.pointer_type(tl.float16))
+                     + offs_l).to(tl.float32)
+        zp = tl.load((Cache + base + ZP_OFF).to(tl.pointer_type(tl.float16))
+                     + offs_l).to(tl.float32)
+        pt = tl.load((Cache + base + SR_OFF).to(tl.pointer_type(tl.float16))
+                     + intra).to(tl.float32)
+        lat = tl.interleave((pk & 0xF).to(tl.float32),
+                            ((pk >> 4) & 0xF).to(tl.float32))
+        lat = (lat * sc + zp) * pt
+        rope = tl.load((Cache + base + RP_OFF).to(tl.pointer_type(tl.float16))
+                       + intra * RP + offs_r).to(tl.float32)
+        tl.store(dbase + offs_l, lat.to(Dst.dtype.element_ty))
+        tl.store(dbase + L + offs_r, rope.to(Dst.dtype.element_ty))
 
 
 @triton.jit
@@ -481,8 +506,14 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         device = bt.device
         block_table_cpu = bt.tolist()                 # 1 D2H (block ids for slot mgmt)
 
+        # Pool sizing: one in-flight tail (+ one-step flush latency) per request,
+        # plus every block a single chunked-prefill step can write — a chunk
+        # spans up to max_num_batched_tokens / G blocks across the batch, and
+        # those blocks hold pool slots until flushed on the following step.
+        sched = self.vllm_config.scheduler_config
         pool_slots = int(os.environ.get("KVARN_MLA_POOL_SLOTS", "0")) or max(
-            2 * self.vllm_config.scheduler_config.max_num_seqs, 64)
+            2 * sched.max_num_seqs
+            + (sched.max_num_batched_tokens + G - 1) // G, 64)
         # b2s_t MUST be sized to the FULL block-id range up front: its pointer is
         # baked into the captured CUDA graph (forward_mqa), so a runtime realloc
         # (triggered when a block id first exceeds the current size) leaves the
@@ -503,78 +534,81 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         b2s_t = cls._kvarn_b2slot_t[device]
         b2s_dict = cls._kvarn_b2slot_dict
         free = cls._kvarn_free_slots
-        prev_sl = cls._kvarn_prev_sl
-        watermark = cls._kvarn_watermark
+        fill = cls._kvarn_fill
 
-        # ── FRESH-REQUEST RESET (cross-generate correctness) ────────────────
-        # prev_sl/watermark are keyed by row[0] = a sequence's first PHYSICAL
-        # block id, which vLLM RECYCLES across requests/generates. The stale-key
-        # cleanup below only drops keys NOT seen this step, so a new request that
-        # reuses a freed block id would inherit the finished request's watermark
-        # and skip flushing its early blocks -> cross-generate contamination
-        # (the multi-seed/2nd-generate degradation: AIME seed#2 0% vs seed#1 20%).
-        # A new request always begins with a prefill step (query_len > 1; chunked
-        # prefill is off), so on that step force its flush state to zero BEFORE
-        # blocks_needed and the flush loop read prev_sl.
+        # ── Sharing-safe slot lifecycle (prefix caching + chunked prefill) ──
+        # No per-request state: vLLM's prefix caching shares physical blocks
+        # across LIVE requests and recycles ids across finished ones, so any
+        # request-identity proxy (the old prev_sl/watermark keyed by row[0])
+        # collides under sharing — two requests with a common prefix share
+        # row[0], their flush state flip-flops, and blocks get quantized
+        # half-written or their slots freed in use (the issue #10 "illegal
+        # memory access after ~37 min" / repetition-collapse class). Everything
+        # below derives from per-step facts instead:
+        #   committed = seq_len - query_len   (tokens written BEFORE this step;
+        #     this step's tokens land in forward, after the builder — also
+        #     correct under chunked prefill and spec decode, where query_len
+        #     covers the whole chunk / verify window)
+        #   b2s_dict membership = "block is unflushed" (ground truth: a flush
+        #     frees the slot, so a slot-holding block below the committed
+        #     boundary is exactly a full-but-unflushed block).
         qsl = getattr(common_attn_metadata, "query_start_loc_cpu", None)
         if qsl is not None:
             qsl = qsl.tolist()
             query_lens = [qsl[i + 1] - qsl[i] for i in range(B)]
         else:
             query_lens = [(n_tok // B if B else 1)] * B
-        n_prefill = 0
-        for b in range(B):
-            row = block_table_cpu[b]
-            if query_lens[b] > 1 and row and row[0] >= 0:
-                prev_sl[row[0]] = 0       # pool holds no prior data for this id
-                watermark[row[0]] = 0     # nothing flushed yet for this id
-                n_prefill += 1
-        if n_prefill and os.environ.get("KVARN_MLA_DBG"):
-            im0 = impls[0]
-            print(f"[KVDBG] BUILD prefill={n_prefill}/{B} "
-                  f"b2s_ptr={b2s_t.data_ptr():x} b2s_n={b2s_t.shape[0]} "
-                  f"latpool_ptr={None if im0._kvarn_lat_pool is None else hex(im0._kvarn_lat_pool.data_ptr())} "
-                  f"free={len(free)} dict={len(b2s_dict)} wm={len(watermark)}", flush=True)
 
-        # blocks that must hold a pool slot now = the in-progress (unflushed)
-        # blocks written from the previous step through this step:
-        # block_table[b][prev_sl//G .. sl//G]. For a fresh prefill (prev_sl=0)
-        # that's all prompt blocks (== what slot_mapping named); for decode it's
-        # just the current tail. Derived from block_table -> no slot_mapping D2H.
         blocks_needed: set[int] = set()
+        flush_seen: set[int] = set()
+        flush_q: list[int] = []
         for b in range(B):
             row = block_table_cpu[b]
             sl = seq_lens_cpu[b]
             if not row or sl <= 0:
                 continue
-            k0 = (prev_sl.get(row[0], 0) // G) if row[0] >= 0 else 0
-            for k in range(k0, sl // G + 1):
-                if k < len(row) and row[k] >= 0:
-                    blocks_needed.add(row[k])
+            committed = max(sl - query_lens[b], 0)
+            # Blocks receiving writes this step need pool slots. Record how
+            # full each will be AFTER the step: if its owner finishes on the
+            # step that fills it, the reclaim below must flush (not discard).
+            # For a cache-hit prefill, committed = the cached length, so the
+            # shared context blocks correctly need no slots here.
+            for k in range(committed // G, min((sl - 1) // G, len(row) - 1) + 1):
+                bid = row[k]
+                if bid >= 0:
+                    blocks_needed.add(bid)
+                    fill[bid] = min(sl, (k + 1) * G) - k * G
+            # FLUSH detection: walk backward from the committed boundary while
+            # blocks still hold pool slots — those are full-but-unflushed.
+            # Stops at the first slotless block (flushes happen in order, so
+            # everything earlier is already int4). Idempotent under sharing:
+            # a co-owner finds the block already queued (or slotless) and stops.
+            k = committed // G - 1
+            while 0 <= k < len(row):
+                bid = row[k]
+                if bid < 0 or bid in flush_seen or bid not in b2s_dict:
+                    break
+                flush_seen.add(bid)
+                flush_q.append(bid)
+                k -= 1
 
-        # (1) FLUSH: blocks fully filled by the PREVIOUS step's tokens.
-        flush_ids: list[int] = []
-        seen: set[int] = set()
-        for b in range(B):
-            row = block_table_cpu[b]
-            sl = seq_lens_cpu[b]
-            if not row or sl <= 0 or row[0] < 0:
+        # RECLAIM: slot-holding blocks neither written this step nor already
+        # queued belong to finished (or descheduled) requests. A COMPLETE one
+        # is flushed — vLLM's prefix cache may hand the block to a future
+        # request, which must find a valid int4 tile (the old discard left
+        # stale tile bytes for the cache hit to read). A partial one is safe
+        # to discard: vLLM never prefix-caches partial blocks.
+        discard_ids: list[int] = []
+        for bid in list(b2s_dict):
+            if bid in blocks_needed or bid in flush_seen:
                 continue
-            key = row[0]
-            seen.add(key)
-            complete = prev_sl.get(key, 0) // G    # blocks 0..complete-1 full in pool
-            wm = watermark.get(key, 0)
-            for k in range(wm, complete):
-                if k < len(row) and row[k] >= 0:
-                    flush_ids.append(row[k])
-            if complete > wm:
-                watermark[key] = complete
-            prev_sl[key] = sl
-        for stale in [k for k in prev_sl if k not in seen]:
-            del prev_sl[stale]
-            watermark.pop(stale, None)
+            if fill.get(bid, 0) >= G:
+                flush_seen.add(bid)
+                flush_q.append(bid)
+            else:
+                discard_ids.append(bid)
 
-        if flush_ids:
+        if flush_q:
             # Batch ALL (layer, block) flush tiles into one vectorized flush
             # instead of per-tile eager ops (the 25%-GPU / 66%-util hot spot).
             iters = int(os.environ.get("KVARN_SINKHORN_ITERS", "16"))
@@ -582,7 +616,7 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
             for impl in impls:
                 if impl._kv_cache_ref is None:
                     continue
-                for bid in flush_ids:
+                for bid in flush_q:
                     slot = b2s_dict.get(bid)
                     if slot is not None:
                         flush_list.append((impl, bid, slot))
@@ -593,17 +627,16 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
                                            impl._kv_cache_ref, bid, already_rotated=True)
             else:
                 cls._kvarn_batched_flush(flush_list, iters)
-            for bid in flush_ids:
-                slot = b2s_dict.pop(bid, None)
-                if slot is not None:
-                    free.append(slot)
-                    if bid < b2s_t.shape[0]:
-                        b2s_t[bid] = -1
-
-        # (2) RECLAIM slots held by blocks no longer needed (finished requests'
-        # partial tails that never filled -> never flushed).
-        for bid in [b for b in b2s_dict if b not in blocks_needed]:
+        for bid in flush_q:
+            slot = b2s_dict.pop(bid, None)
+            fill.pop(bid, None)
+            if slot is not None:
+                free.append(slot)
+                if bid < b2s_t.shape[0]:
+                    b2s_t[bid] = -1
+        for bid in discard_ids:
             slot = b2s_dict.pop(bid)
+            fill.pop(bid, None)
             free.append(slot)
             if bid < b2s_t.shape[0]:
                 b2s_t[bid] = -1
@@ -779,8 +812,12 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 cls._kvarn_pool_size = 0
                 cls._kvarn_b2slot_t = {}                        # device -> int32[num_blocks]
                 cls._kvarn_impls = []                           # list of live impls
-                cls._kvarn_prev_sl = {}                         # req_key(block0) -> prev seq_len
-                cls._kvarn_watermark = {}                       # req_key -> next block to flush
+                # block_id -> tokens present in the pool for that block after
+                # the current step. Keyed by PHYSICAL block (not request), so it
+                # stays correct when prefix caching shares blocks across
+                # requests; a partial block has exactly one writer, so the
+                # value has a single source. Drives flush-on-reclaim.
+                cls._kvarn_fill = {}
             if self._kvarn_graph:
                 cls._kvarn_impls.append(self)
 

@@ -286,24 +286,65 @@ class KVarNConfig:
     @staticmethod
     def estimate_weight_bytes(model: str, tensor_parallel_size: int = 1) -> int | None:
         """Best-effort per-rank model weight size in bytes, read from the
-        checkpoint files on disk (exact, and cheap — no CUDA context, which the
-        early `check_and_update_config` hook must avoid). Returns None if the
+        checkpoint files on disk (exact, and cheap, with no CUDA context, which
+        the early `check_and_update_config` hook must avoid). Returns None if the
         files can't be located, so the caller falls back to the legacy budget.
 
         Resolves a local directory directly, or the local HF cache snapshot for
-        a repo id (never downloads). Sums *.safetensors (or *.bin) and divides by
-        the tensor-parallel degree (weights shard ~evenly across ranks)."""
+        a repo id (never downloads). Prefers the shards named in a
+        `*.safetensors.index.json` (or `*.bin.index.json`) manifest, which is
+        exactly the set the loader reads. This avoids double-counting a repo that
+        ships both a single consolidated checkpoint and the sharded HF set (e.g.
+        Mistral-7B-Instruct-v0.3 carries `consolidated.safetensors` alongside
+        `model-0000n-of-0000m.safetensors`, which a plain glob sums to ~2x the
+        real weight size). Divides by the tensor-parallel degree (weights shard
+        ~evenly across ranks)."""
         import glob as _glob
+        import json as _json
 
         try:
             d = model
             if not os.path.isdir(d):
-                # Repo id → resolve the already-cached snapshot, if any.
+                # Repo id: resolve the already-cached snapshot, if any.
                 try:
                     from huggingface_hub import snapshot_download
+
                     d = snapshot_download(model, local_files_only=True)
                 except Exception:
                     return None
+
+            # 1) Prefer the loader's own manifest: sum only the shards it lists,
+            #    so a stray consolidated/single-file copy is not double-counted.
+            for ext in ("safetensors", "bin"):
+                indexes = _glob.glob(
+                    os.path.join(d, "**", f"*.{ext}.index.json"), recursive=True
+                )
+                if not indexes:
+                    continue
+                try:
+                    with open(indexes[0]) as fh:
+                        weight_map = _json.load(fh).get("weight_map", {})
+                    base = os.path.dirname(indexes[0])
+                    shards = [
+                        os.path.join(base, s) for s in sorted(set(weight_map.values()))
+                    ]
+                    shards = [p for p in shards if os.path.exists(p)]
+                    if shards:
+                        total = sum(os.path.getsize(p) for p in shards)
+                        if total > 0:
+                            return total // max(tensor_parallel_size, 1)
+                except Exception:
+                    pass  # fall through to the single-file / glob paths
+
+            # 2) No usable manifest: prefer a canonical single-file checkpoint.
+            for single in ("model.safetensors", "consolidated.safetensors"):
+                p = os.path.join(d, single)
+                if os.path.exists(p):
+                    total = os.path.getsize(p)
+                    if total > 0:
+                        return total // max(tensor_parallel_size, 1)
+
+            # 3) Fallback: sum whatever weight shards are present.
             files = _glob.glob(os.path.join(d, "**", "*.safetensors"), recursive=True)
             if not files:
                 files = _glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)

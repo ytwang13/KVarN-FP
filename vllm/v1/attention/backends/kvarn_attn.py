@@ -184,6 +184,14 @@ class KVarNAttentionBackend(AttentionBackend):
         return attn_type == AttentionType.DECODER
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        # Causality is purely a masking choice; the KV quantization is
+        # independent of it. The per-token verify path attends each query row
+        # to [0, vq_seqlen[row]) — a flat full-context length per row gives
+        # bidirectional attention (used by DFlash cross-attention drafting).
+        return True
+
+    @classmethod
     def supports_per_head_quant_scales(cls) -> bool:
         return False
 
@@ -283,6 +291,11 @@ class KVarNMetadata(AttentionMetadata):
     vq_req: torch.Tensor | None = None                # [num_decode_tokens] int32 block-table row
     vq_seqlen: torch.Tensor | None = None             # [num_decode_tokens] int32 causal length
     vq_qlen: int = 0                                  # uniform decode query len (>=2), else 0
+    # Non-causal (bidirectional) attention: each query row attends to the full
+    # context (no bottom-right causal staircase). Set by DFlash cross-attention
+    # drafting via CommonAttentionMetadata.causal=False. When False, the verify
+    # plan stores a flat full-context length per row instead of committed+j+1.
+    causal: bool = True
 
 
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
@@ -732,6 +745,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     vq_cap, dtype=torch.int32, pin_memory=True)
                 self._vq_seqlen_host = torch.empty(
                     vq_cap, dtype=torch.int32, pin_memory=True)
+            # Non-causal (DFlash cross-attention): every query row attends to
+            # the full context, so its per-row limit is the whole seq_len, not
+            # the bottom-right causal staircase committed+j+1.
+            non_causal = not getattr(cam, "causal", True)
             i = 0
             uniform = query_lens_cpu[0] if num_decodes else 0
             for b in range(num_decodes):
@@ -739,14 +756,18 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if ql != uniform:
                     uniform = 0
                 committed = max(seq_lens_cpu[b] - ql, 0)
+                full = committed + ql
                 for j in range(ql):
                     self._vq_req_host[i] = b
-                    self._vq_seqlen_host[i] = committed + j + 1
+                    self._vq_seqlen_host[i] = full if non_causal else committed + j + 1
                     i += 1
             # Uniform query length -> the shared-dequant verify kernel (the
             # request's tokens share each block's dequant); this is always the
-            # case under uniform-batch graph capture.
-            vq_qlen = uniform if uniform >= 2 else 0
+            # case under uniform-batch graph capture. The shared kernel bakes
+            # the bottom-right causal staircase internally, so non-causal must
+            # fall back to the per-token path (which honours the flat per-row
+            # limit above) — force vq_qlen=0 in that case.
+            vq_qlen = uniform if (uniform >= 2 and not non_causal) else 0
             vq_req_t = self._vq_req_buf[:num_decode_tokens]
             vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
             vq_req_t.copy_(self._vq_req_host[:num_decode_tokens],
@@ -789,6 +810,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             vq_req=vq_req_t,
             vq_seqlen=vq_seqlen_t,
             vq_qlen=vq_qlen,
+            causal=getattr(cam, "causal", True),
         )
 
 
@@ -1833,18 +1855,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # ── attention sub-paths ──────────────────────────────────────────────────
 
     def _flash_varlen(
-        self, q, k, v, cu_q, cu_k, max_q, max_k,
+        self, q, k, v, cu_q, cu_k, max_q, max_k, causal=True,
     ) -> torch.Tensor:
         if self.fa_version is None:
             return flash_attn_varlen_func(
                 q=q, k=k, v=v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=max_q, max_seqlen_k=max_k,
-                softmax_scale=self.scale, causal=True,
+                softmax_scale=self.scale, causal=causal,
             )
         return flash_attn_varlen_func(
             q=q, k=k, v=v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
             max_seqlen_q=max_q, max_seqlen_k=max_k,
-            softmax_scale=self.scale, causal=True, fa_version=self.fa_version,
+            softmax_scale=self.scale, causal=causal, fa_version=self.fa_version,
         )
 
     def _prefill_first_chunk(
@@ -1853,6 +1875,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """First-chunk prefill: every request's full prompt is in the current
         batch, so attention runs on raw K/V via flash_attn_varlen. The K/V
         have already been written to the cache by `do_kv_cache_update`."""
+        causal = getattr(attn_metadata, "causal", True)
         # FlashAttention caps head_dim at 256; the head_dim-512 global layers of
         # Gemma-4 must use the SDPA path (handles arbitrary head_dim). Prefill is
         # a one-time cost (decode dominates at long context), so SDPA here is fine.
@@ -1863,6 +1886,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 cu_k=attn_metadata.query_start_loc,
                 max_q=attn_metadata.max_query_len,
                 max_k=attn_metadata.max_query_len,
+                causal=causal,
             )
         # Per-request SDPA fallback (e.g. when flash_attn isn't available).
         outputs = []
@@ -1875,7 +1899,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             k_r = k[qs:qe].transpose(0, 1).unsqueeze(0)
             v_r = v[qs:qe].transpose(0, 1).unsqueeze(0)
             o = F.scaled_dot_product_attention(
-                q_r, k_r, v_r, is_causal=True, scale=self.scale,
+                q_r, k_r, v_r, is_causal=causal, scale=self.scale,
                 enable_gqa=self.num_kv_heads < self.num_heads,
             )
             outputs.append(o[0].transpose(0, 1))         # [q_len, Hq, D]
@@ -2180,6 +2204,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cu_k=cu_k,
             max_q=md.max_query_len,
             max_k=max_k,
+            causal=getattr(md, "causal", True),
         )
         return torch.mm(out_rot.reshape(-1, D), H16).view(
             n_tok, self.num_heads, D)
@@ -2220,6 +2245,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             fa_cu_seqlens_k=dec_cu_k,
             fa_max_blocks_per_req=mbpr,
             fa_max_seqlen_k_fixed=self._max_model_len,
+            causal=getattr(attn_metadata, "causal", True),
         )
         if attn_metadata.vq_seqlen is not None:
             # Spec-as-decode: the decode portion carries multi-token verify
@@ -2246,6 +2272,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             max_query_len=attn_metadata.max_query_len,
             max_seq_len=attn_metadata.max_seq_len,  # WSL fix (PR #16): avoid per-step .item() D2H sync (global max is a safe upper bound for the prefill kernel)
             is_prefill=True,
+            causal=getattr(attn_metadata, "causal", True),
         )
         if attn_metadata.has_cached_multiquery:
             # The multi-query (prefill-classified) requests here are speculative

@@ -2,11 +2,11 @@
 # Dense KVarN prefix-caching fix validation battery (issue #10 loops).
 # Runs sequentially on one GPU; each phase writes /tmp/prefix_*.json + a log.
 set -u
-cd /mnt/nvme1/KVarN
+cd "${KVAR_N_ROOT:-/mnt/nvme1/KVarN}"
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 export VLLM_USE_FLASHINFER_SAMPLER=0
-export HF_HUB_CACHE=/mnt/nvme1/huggingface
-export MODEL=/mnt/nvme1/huggingface/models--cyankiwi--Qwen3.6-27B-AWQ-BF16-INT4/snapshots/232ed78ba2a5eba6c39cd36d1e11ff7347e0883e
+export HF_HUB_CACHE="${HF_HUB_CACHE:-/scratch/yw6594/cache/huggingface/hub}"
+export MODEL="${MODEL:-Qwen/Qwen3-4B}"
 export KV=kvarn_k4v2_g128
 PY=.venv/bin/python
 

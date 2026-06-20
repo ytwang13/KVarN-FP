@@ -63,7 +63,7 @@ VLLM_USE_PRECOMPILED=1 pip install -e .
 from vllm import LLM, SamplingParams
 
 llm = LLM(
-    model="Qwen/Qwen3-32B",
+    model="Qwen/Qwen3-4B",
     dtype="float16",                    # KVarN runs in float16
     kv_cache_dtype="kvarn_k4v2_g128",   # enable KVarN
     block_size=128,                     # KVarN tile size

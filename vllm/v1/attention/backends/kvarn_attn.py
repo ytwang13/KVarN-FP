@@ -139,8 +139,10 @@ class KVarNAttentionBackend(AttentionBackend):
         torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "kvarn_k2v2_g128",
         "kvarn_k4v4_g128",
         "kvarn_k4v2_g128",
+        "kvarn_k2v2_g64",
         "kvarn_k4v4_g64",
         "kvarn_k4v2_g64",
     ]

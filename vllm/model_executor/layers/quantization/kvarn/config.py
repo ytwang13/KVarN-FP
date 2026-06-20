@@ -19,8 +19,10 @@ from dataclasses import dataclass
 # (key error propagates through the softmax exponentials, value error is averaged
 # out by the softmax weights), so the shipped preset spends more bits on keys.
 KVARN_PRESETS: dict[str, dict] = {
+    "kvarn_k2v2_g128": {"key_bits": 2, "value_bits": 2, "group": 128},
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
     "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
+    "kvarn_k2v2_g64": {"key_bits": 2, "value_bits": 2, "group": 64},
     "kvarn_k4v2_g64": {"key_bits": 4, "value_bits": 2, "group": 64},
     "kvarn_k4v4_g64": {"key_bits": 4, "value_bits": 4, "group": 64},
 }

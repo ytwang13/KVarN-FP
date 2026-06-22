@@ -72,6 +72,19 @@ def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
     return KVARN_MAX_KV_SPLITS
 
 
+@triton.jit
+def _fp4_e2m1_decode(q):
+    """Decode signed E2M1 FP4 nibbles to fp32."""
+    sign = tl.where((q & 0x8) != 0, -1.0, 1.0)
+    mag = q & 0x7
+    exp = mag >> 1
+    mant = mag & 0x1
+    subnormal = mant.to(tl.float32) * 0.5
+    normal = (1.0 + mant.to(tl.float32) * 0.5) * tl.exp2(
+        (exp - 1).to(tl.float32))
+    return sign * tl.where(exp == 0, subnormal, normal)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dequant kernel: int4 quantised tile → rotated fp16 packed buffer.
 # SUPERSEDED by `_kvarn_build_packed_kv_kernel` (the unified block_table-driven
@@ -101,6 +114,7 @@ def _kvarn_dequant_blocks_kernel(
     V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr,
     V_ZP_OFFSET: tl.constexpr,
+    FP4_CACHE: tl.constexpr,
 ):
     """Dequantise one (block, kv_head) tile per program.
 
@@ -155,7 +169,11 @@ def _kvarn_dequant_blocks_kernel(
         + g_byte_k[None, :]
     )
     k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-    q_K = ((k_bytes >> g_shift_k[None, :]) & 0xF).to(tl.float32)
+    q_K_i = (k_bytes >> g_shift_k[None, :]) & 0xF
+    if FP4_CACHE:
+        q_K = _fp4_e2m1_decode(q_K_i)
+    else:
+        q_K = q_K_i.to(tl.float32)
     K_rot = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]   # [D, GROUP]
     K_rot_out = tl.trans(K_rot)                                           # [GROUP, D]
 
@@ -179,7 +197,11 @@ def _kvarn_dequant_blocks_kernel(
         + d_byte_v[None, :]
     )
     v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-    q_V = ((v_bytes >> d_shift_v[None, :]) & 0xF).to(tl.float32)
+    q_V_i = (v_bytes >> d_shift_v[None, :]) & 0xF
+    if FP4_CACHE:
+        q_V = _fp4_e2m1_decode(q_V_i)
+    else:
+        q_V = q_V_i.to(tl.float32)
     V_rot = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]   # [GROUP, D]
 
     # Write to scratch ([token, kv_head, dim] layout).
@@ -300,6 +322,7 @@ def _kvarn_build_packed_kv_kernel(
     V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr,
     V_ZP_OFFSET: tl.constexpr,
+    FP4_CACHE: tl.constexpr,
 ):
     """Grid: (B * MAX_BLOCKS_PER_REQ, Hk). One (request-block, head) per program.
     b is always < B by construction (grid dim 0 == B*MAX_BLOCKS_PER_REQ), so no
@@ -375,7 +398,11 @@ def _kvarn_build_packed_kv_kernel(
         k_addrs = (tile_base + K_PACKED_OFFSET
                    + d_offs[:, None] * (GROUP // PACK_K) + g_byte_k[None, :])
         k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-        q_K = ((k_bytes >> g_shift_k[None, :]) & MASK_K).to(tl.float32)
+        q_K_i = (k_bytes >> g_shift_k[None, :]) & MASK_K
+        if FP4_CACHE:
+            q_K = _fp4_e2m1_decode(q_K_i)
+        else:
+            q_K = q_K_i.to(tl.float32)
         K_rot = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]   # [D, GROUP]
         K_rot_out = tl.trans(K_rot)                                          # [GROUP, D]
 
@@ -392,7 +419,11 @@ def _kvarn_build_packed_kv_kernel(
         v_addrs = (tile_base + V_PACKED_OFFSET
                    + g_offs[:, None] * (D // PACK_V) + d_byte_v[None, :])
         v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-        q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+        q_V_i = (v_bytes >> d_shift_v[None, :]) & MASK_V
+        if FP4_CACHE:
+            q_V = _fp4_e2m1_decode(q_V_i)
+        else:
+            q_V = q_V_i.to(tl.float32)
         V_rot = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]   # [GROUP, D]
 
         tl.store(K_out_ptr + out_addrs, K_rot_out.to(tl.float16), mask=g_mask[:, None])
@@ -519,6 +550,7 @@ def _kvarn_fused_decode_kernel(
     V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr,
     V_ZP_OFFSET: tl.constexpr,
+    FP4_CACHE: tl.constexpr,
     VQ_INDIRECT: tl.constexpr,
 ):
     # GQA head-grouping: ONE program per (request, KV head) serves all Q_PER_KV
@@ -618,7 +650,11 @@ def _kvarn_fused_decode_kernel(
                 k_addrs = (tile_base + K_PACKED_OFFSET
                            + d_offs[:, None] * (GROUP // PACK_K) + cb_k[None, :])
                 k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)                  # [D, BN]
-                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                q_K_i = (k_bytes >> cs_k[None, :]) & MASK_K
+                if FP4_CACHE:
+                    q_K = _fp4_e2m1_decode(q_K_i)
+                else:
+                    q_K = q_K_i.to(tl.float32)
                 K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]      # [D, BN]
 
                 s_row_V = tl.load(ku16 + (V_S_ROW_OFFSET // 2) + cols).to(tl.float16, bitcast=True).to(tl.float32)  # [BN]
@@ -626,7 +662,11 @@ def _kvarn_fused_decode_kernel(
                 v_addrs = (tile_base + V_PACKED_OFFSET
                            + cols[:, None] * (D // PACK_V) + d_byte_v[None, :])
                 v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)                  # [BN, D]
-                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                q_V_i = (v_bytes >> d_shift_v[None, :]) & MASK_V
+                if FP4_CACHE:
+                    q_V = _fp4_e2m1_decode(q_V_i)
+                else:
+                    q_V = q_V_i.to(tl.float32)
                 Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]        # [BN, D]
 
             # scores[h,c] = q·Kᵀ via tensor cores (q [Q_PER_KV,D] · K_dg [D,BN]).
@@ -686,6 +726,7 @@ def _kvarn_fused_decode_stage1(
     K_ZP_OFFSET: tl.constexpr, K_S_ROW_OFFSET: tl.constexpr,
     V_PACKED_OFFSET: tl.constexpr, V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr, V_ZP_OFFSET: tl.constexpr,
+    FP4_CACHE: tl.constexpr,
     VQ_INDIRECT: tl.constexpr,
 ):
     b = tl.program_id(0)
@@ -754,7 +795,11 @@ def _kvarn_fused_decode_stage1(
                 s_row_K = tl.load(ku16 + (K_S_ROW_OFFSET // 2) + cols).to(tl.float16, bitcast=True).to(tl.float32)
                 k_addrs = (tile_base + K_PACKED_OFFSET + d_offs[:, None] * (GROUP // PACK_K) + cb_k[None, :])
                 k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                q_K_i = (k_bytes >> cs_k[None, :]) & MASK_K
+                if FP4_CACHE:
+                    q_K = _fp4_e2m1_decode(q_K_i)
+                else:
+                    q_K = q_K_i.to(tl.float32)
                 K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
                 s_row_V = tl.load(ku16 + (V_S_ROW_OFFSET // 2) + cols).to(tl.float16, bitcast=True).to(tl.float32)
                 zp_V = tl.load(ku16 + (V_ZP_OFFSET // 2) + cols).to(tl.float16, bitcast=True).to(tl.float32)
@@ -765,7 +810,11 @@ def _kvarn_fused_decode_stage1(
                 # The single-stage kernel already used (D // PACK_V); this matches it.
                 v_addrs = (tile_base + V_PACKED_OFFSET + cols[:, None] * (D // PACK_V) + d_byte_v[None, :])
                 v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                q_V_i = (v_bytes >> d_shift_v[None, :]) & MASK_V
+                if FP4_CACHE:
+                    q_V = _fp4_e2m1_decode(q_V_i)
+                else:
+                    q_V = q_V_i.to(tl.float32)
                 Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
 
             scores = tl.dot(q, K_dg)
@@ -887,6 +936,7 @@ def kvarn_decode_attention(
         K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
         V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
         V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        FP4_CACHE=cfg.fp4,
         VQ_INDIRECT=False,
     )
     # SPLIT-K (KVARN_SPLIT_K=1): two-stage flash-decoding — only a win in the
@@ -978,6 +1028,7 @@ def kvarn_decode_attention(
                 K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
                 V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
                 V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+                FP4_CACHE=cfg.fp4,
                 num_warps=4, num_stages=2,
             )
         with torch.profiler.record_function("kvarn_flash_attn"):
@@ -1048,6 +1099,7 @@ def kvarn_verify_attention(
         K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
         V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
         V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        FP4_CACHE=cfg.fp4,
     )
 
     out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
@@ -1201,6 +1253,7 @@ def _kvarn_fused_verify_stage1(
     K_ZP_OFFSET: tl.constexpr, K_S_ROW_OFFSET: tl.constexpr,
     V_PACKED_OFFSET: tl.constexpr, V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr, V_ZP_OFFSET: tl.constexpr,
+    FP4_CACHE: tl.constexpr,
 ):
     b = tl.program_id(0)
     hk = tl.program_id(1)
@@ -1280,7 +1333,11 @@ def _kvarn_fused_verify_stage1(
                 k_addrs = (tile_base + K_PACKED_OFFSET
                            + d_offs[:, None] * (GROUP // PACK_K) + cb_k[None, :])
                 k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                q_K_i = (k_bytes >> cs_k[None, :]) & MASK_K
+                if FP4_CACHE:
+                    q_K = _fp4_e2m1_decode(q_K_i)
+                else:
+                    q_K = q_K_i.to(tl.float32)
                 K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
                 s_row_V = tl.load((KV_cache_ptr + tile_base + V_S_ROW_OFFSET).to(
                     tl.pointer_type(tl.float16)) + cols).to(tl.float32)
@@ -1289,7 +1346,11 @@ def _kvarn_fused_verify_stage1(
                 v_addrs = (tile_base + V_PACKED_OFFSET
                            + cols[:, None] * (D // PACK_V) + d_byte_v[None, :])
                 v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                q_V_i = (v_bytes >> d_shift_v[None, :]) & MASK_V
+                if FP4_CACHE:
+                    q_V = _fp4_e2m1_decode(q_V_i)
+                else:
+                    q_V = q_V_i.to(tl.float32)
                 Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
 
             scores = tl.dot(q, K_dg)                              # [M, BN]

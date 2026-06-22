@@ -25,6 +25,49 @@ from vllm.model_executor.layers.quantization.kvarn.sinkhorn import (
     variance_normalize,
 )
 
+FP4_E2M1_MAX = 6.0
+FP4_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _pow2_scale_exp(absmax: torch.Tensor) -> torch.Tensor:
+    """ceil(log2(absmax / 6)) using frexp, zero rows -> exponent 0."""
+    scale = absmax / FP4_E2M1_MAX
+    mant, exp = torch.frexp(scale)
+    e = torch.where(mant <= 0.5, exp - 1, exp)
+    return torch.where(scale > 0, e, torch.zeros_like(e)).to(torch.int64)
+
+
+def _e2m1_nearest_code(x: torch.Tensor) -> torch.Tensor:
+    """Encode signed E2M1 FP4 nibbles after P2 scaling.
+
+    Code layout is IEEE-like: bit3 sign, bits[2:1] exponent, bit0 mantissa.
+    Positive magnitudes map as:
+      0, .5, 1, 1.5, 2, 3, 4, 6 -> codes 0..7.
+    """
+    sign = (x < 0).to(torch.int32) << 3
+    a = x.abs().float().clamp(max=FP4_E2M1_MAX)
+    grid = torch.tensor(FP4_E2M1_GRID, dtype=a.dtype, device=a.device)
+    dist = (a.unsqueeze(-1) - grid).abs()
+    mag_code = dist.argmin(dim=-1).to(torch.int32)
+    return torch.where(a == 0, mag_code, mag_code | sign)
+
+
+def _fp4_p2_per_row(
+    balanced: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """P2-FP4 E2M1 per-row quantization for KVarN balanced tiles.
+
+    Returns:
+        q: uint-like int32 nibble codes.
+        scale: decoded power-of-two scale [N, R, 1].
+    """
+    absmax = balanced.abs().amax(dim=2, keepdim=True)
+    e_scale = _pow2_scale_exp(absmax)
+    clamped = torch.ldexp(balanced.float(), -e_scale)
+    q = _e2m1_nearest_code(clamped)
+    scale = torch.exp2(e_scale.float())
+    return q, scale
+
 
 def _rtn_range(t: torch.Tensor, dim: int):
     """Per-row range. With KVARN_RTN_QUANTILE=q > 0 (e.g. 0.005), uses
@@ -165,6 +208,7 @@ def kvarn_store_tile_k_batch_from_sinkhorn(
     s_col: torch.Tensor,
     s_row: torch.Tensor,
     bits: int,
+    fp4: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Batched K-path RTN + scale absorption + 4-bit packing.
 
@@ -182,6 +226,20 @@ def kvarn_store_tile_k_batch_from_sinkhorn(
         zp_K           : ``[N, D]``         fp16 — absorbed per-channel zero
         s_row_K        : ``[N, group]``     fp16 — per-token sinkhorn scale
     """
+    if fp4:
+        assert bits == 4, "FP4 KVarN requires 4-bit K payloads"
+        q, scale = _fp4_p2_per_row(balanced)
+        s_col_K = (s_row * scale.squeeze(-1)).to(torch.float16)
+        zp_K = torch.zeros_like(s_col_K)
+        s_row_K = s_col.to(torch.float16)
+        q_packed = _pack_lowbit(q, bits)
+        return {
+            "q_packed_uint8": q_packed,
+            "s_col_K": s_col_K,
+            "zp_K": zp_K,
+            "s_row_K": s_row_K,
+        }
+
     qmax = (1 << bits) - 1
     N, R, C = balanced.shape
     lo, hi = _rtn_range(balanced, dim=2)                              # [N, R, 1]
@@ -205,6 +263,7 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
     s_col: torch.Tensor,
     s_row: torch.Tensor,
     bits: int,
+    fp4: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Batched V-path RTN + scale absorption + 4-bit packing.
 
@@ -216,6 +275,20 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
 
     Returns dict of per-tile (N-batched) tensors mirroring `kvarn_store_tile_v`.
     """
+    if fp4:
+        assert bits == 4, "FP4 KVarN requires 4-bit V payloads"
+        q, scale = _fp4_p2_per_row(balanced)
+        s_row_V = (s_row * scale.squeeze(-1)).to(torch.float16)
+        zp_V = torch.zeros_like(s_row_V)
+        s_col_V = s_col.to(torch.float16)
+        q_packed = _pack_lowbit(q, bits)
+        return {
+            "q_packed_uint8": q_packed,
+            "s_col_V": s_col_V,
+            "s_row_V": s_row_V,
+            "zp_V": zp_V,
+        }
+
     qmax = (1 << bits) - 1
     N, R, C = balanced.shape
     lo, hi = _rtn_range(balanced, dim=2)                              # [N, R, 1]

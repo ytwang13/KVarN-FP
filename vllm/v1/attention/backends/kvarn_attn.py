@@ -110,16 +110,16 @@ def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
             torch.cat([K_tiles, V_tiles], dim=0), iterations=cfg.sinkhorn_iters,
         )
         K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-            bal[:nk], sc[:nk], sr[:nk], bits=cfg.key_bits)
+            bal[:nk], sc[:nk], sr[:nk], bits=cfg.key_bits, fp4=cfg.fp4)
         V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-            bal[nk:], sc[nk:], sr[nk:], bits=cfg.value_bits)
+            bal[nk:], sc[nk:], sr[nk:], bits=cfg.value_bits, fp4=cfg.fp4)
     else:
         kbal, ksc, ksr = kvarn_sinkhorn_triton(K_tiles, iterations=cfg.sinkhorn_iters)
         vbal, vsc, vsr = kvarn_sinkhorn_triton(V_tiles, iterations=cfg.sinkhorn_iters)
         K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-            kbal, ksc, ksr, bits=cfg.key_bits)
+            kbal, ksc, ksr, bits=cfg.key_bits, fp4=cfg.fp4)
         V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-            vbal, vsc, vsr, bits=cfg.value_bits)
+            vbal, vsc, vsr, bits=cfg.value_bits, fp4=cfg.fp4)
     return K_out, V_out
 
 
@@ -141,9 +141,11 @@ class KVarNAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "kvarn_k2v2_g128",
         "kvarn_k4v4_g128",
+        "kvarn_fp4_k4v4_g128",
         "kvarn_k4v2_g128",
         "kvarn_k2v2_g64",
         "kvarn_k4v4_g64",
+        "kvarn_fp4_k4v4_g64",
         "kvarn_k4v2_g64",
     ]
 
@@ -1273,6 +1275,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+            FP4_CACHE=cfg.fp4,
             VQ_INDIRECT=False,
         )
         # 1. Single-stage fused kernel — runs the @triton.autotune sweep.
@@ -1368,6 +1371,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+            FP4_CACHE=cfg.fp4,
             num_warps=4, num_stages=2,
         )
         torch.cuda.synchronize(device)
@@ -1476,7 +1480,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             zp_K = flat[cfg.k_zp_offset:cfg.k_zp_offset + D * 2].view(torch.float16)
             s_row_K = flat[cfg.k_s_row_offset:cfg.k_s_row_offset + group * 2].view(torch.float16)
             K_rot_DG = kvarn_dequant_tile_k(
-                k_packed, s_col_K, zp_K, s_row_K, group=group, bits=cfg.key_bits)
+                k_packed, s_col_K, zp_K, s_row_K, group=group,
+                bits=cfg.key_bits, fp4=cfg.fp4)
             # Un-rotate: [D, group] → [group, D] (= K rows-tokens), then ⋅H to undo rotation
             K_unrot = K_rot_DG.T @ H  # [group, D]
             K_out[:, h, :] = K_unrot.to(torch.float16)
@@ -1493,7 +1498,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             s_row_V = flat[cfg.v_s_row_offset:cfg.v_s_row_offset + group * 2].view(torch.float16)
             zp_V = flat[cfg.v_zp_offset:cfg.v_zp_offset + group * 2].view(torch.float16)
             V_rot_GD = kvarn_dequant_tile_v(
-                v_packed, s_col_V, s_row_V, zp_V, head_dim=D, bits=cfg.value_bits)
+                v_packed, s_col_V, s_row_V, zp_V, head_dim=D,
+                bits=cfg.value_bits, fp4=cfg.fp4)
             V_unrot = V_rot_GD @ H  # [group, D]
             V_out[:, h, :] = V_unrot.to(torch.float16)
 
@@ -2198,6 +2204,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+            FP4_CACHE=cfg.fp4,
             num_warps=4, num_stages=2,
         )
 

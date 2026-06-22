@@ -1,0 +1,6 @@
+EVALSCOPE_MODEL=Qwen/Qwen3-4B \
+    EVALSCOPE_MAX_MODEL_LEN=32768 \
+    EVALSCOPE_KV_CACHE_DTYPE=kvarn_fp4_k4v4_g128 \
+    EVALSCOPE_BATCH_SIZE=10 \
+    EVALSCOPE_ENABLE_THINKING=1 \
+    bash myscript/evalscope/run_evalscope.sh general

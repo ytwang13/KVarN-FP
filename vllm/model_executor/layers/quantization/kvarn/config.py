@@ -22,9 +22,15 @@ KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k2v2_g128": {"key_bits": 2, "value_bits": 2, "group": 128},
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
     "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
+    "kvarn_fp4_k4v4_g128": {
+        "key_bits": 4, "value_bits": 4, "group": 128, "fp4": True,
+    },
     "kvarn_k2v2_g64": {"key_bits": 2, "value_bits": 2, "group": 64},
     "kvarn_k4v2_g64": {"key_bits": 4, "value_bits": 2, "group": 64},
     "kvarn_k4v4_g64": {"key_bits": 4, "value_bits": 4, "group": 64},
+    "kvarn_fp4_k4v4_g64": {
+        "key_bits": 4, "value_bits": 4, "group": 64, "fp4": True,
+    },
 }
 
 
@@ -63,6 +69,7 @@ class KVarNConfig:
     key_bits: int = 4
     value_bits: int = 4
     group: int = 128
+    fp4: bool = False
     sinkhorn_iters: int = 8         # converges by ~4 iters; 8 lossless vs 16 (validated Qwen3-4B + Qwen3.6-27B AIME)
     sink_tokens: int = 128          # first N tokens per request stay fp16 (NEVER quantised)
     boundary_skip_layers: int = 0   # layer-level skipping off by default; sink_tokens replaces it
@@ -392,6 +399,7 @@ class KVarNConfig:
             key_bits=preset["key_bits"],
             value_bits=preset["value_bits"],
             group=preset["group"],
+            fp4=bool(preset.get("fp4", False)),
             sinkhorn_iters=iters,
             sink_tokens=sink_tokens,
         )

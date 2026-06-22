@@ -60,6 +60,19 @@ def _unpack_lowbit(
     return out
 
 
+def _fp4_e2m1_decode(q: torch.Tensor) -> torch.Tensor:
+    """Decode signed E2M1 FP4 nibbles to fp32 values."""
+    qi = q.to(torch.int32)
+    sign = torch.where((qi & 0x8) != 0, -1.0, 1.0)
+    mag = qi & 0x7
+    exp = mag >> 1
+    mant = mag & 0x1
+    subnormal = 0.5 * mant.float()
+    normal = (1.0 + 0.5 * mant.float()) * torch.exp2((exp - 1).float())
+    val = torch.where(exp == 0, subnormal, normal)
+    return sign * val
+
+
 def kvarn_dequant_tile_k(
     q_packed_uint8: torch.Tensor,
     s_col_K: torch.Tensor,
@@ -67,6 +80,7 @@ def kvarn_dequant_tile_k(
     s_row_K: torch.Tensor,
     group: int,
     bits: int = 4,
+    fp4: bool = False,
 ) -> torch.Tensor:
     """Dequantize one K tile back to the rotated ``[D, group]`` frame.
 
@@ -82,7 +96,8 @@ def kvarn_dequant_tile_k(
         ``[D, group]`` fp32 dequantized tile in the rotated frame.
         Identity: ``out[r,c] = (q[r,c] * s_col_K[r] + zp_K[r]) * s_row_K[c]``.
     """
-    q = _unpack_lowbit(q_packed_uint8, group, bits).float()  # [D, group]
+    q_raw = _unpack_lowbit(q_packed_uint8, group, bits)
+    q = _fp4_e2m1_decode(q_raw) if fp4 else q_raw.float()  # [D, group]
     s_col = s_col_K.float().unsqueeze(-1)                 # [D, 1]
     zp = zp_K.float().unsqueeze(-1)                       # [D, 1]
     s_row = s_row_K.float().unsqueeze(0)                  # [1, group]
@@ -96,6 +111,7 @@ def kvarn_dequant_tile_v(
     zp_V: torch.Tensor,
     head_dim: int,
     bits: int = 4,
+    fp4: bool = False,
 ) -> torch.Tensor:
     """Dequantize one V tile back to the rotated ``[group, D]`` frame.
 
@@ -111,7 +127,8 @@ def kvarn_dequant_tile_v(
         ``[group, head_dim]`` fp32 dequantized tile in the rotated frame.
         Identity: ``out[t,c] = (q[t,c] * s_row_V[t] + zp_V[t]) * s_col_V[c]``.
     """
-    q = _unpack_lowbit(q_packed_uint8, head_dim, bits).float()  # [group, D]
+    q_raw = _unpack_lowbit(q_packed_uint8, head_dim, bits)
+    q = _fp4_e2m1_decode(q_raw) if fp4 else q_raw.float()  # [group, D]
     s_row = s_row_V.float().unsqueeze(-1)                 # [group, 1]
     zp = zp_V.float().unsqueeze(-1)                       # [group, 1]
     s_col = s_col_V.float().unsqueeze(0)                  # [1, D]

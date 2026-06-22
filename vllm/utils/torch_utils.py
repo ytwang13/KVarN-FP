@@ -50,9 +50,11 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "kvarn_k2v2_g128": torch.uint8,
     "kvarn_k4v2_g128": torch.uint8,
     "kvarn_k4v4_g128": torch.uint8,
+    "kvarn_fp4_k4v4_g128": torch.uint8,
     "kvarn_k2v2_g64": torch.uint8,
     "kvarn_k4v2_g64": torch.uint8,
     "kvarn_k4v4_g64": torch.uint8,
+    "kvarn_fp4_k4v4_g64": torch.uint8,
     "kvarn_mla_k4_g128": torch.uint8,
     "nvfp4": torch.uint8,
 }

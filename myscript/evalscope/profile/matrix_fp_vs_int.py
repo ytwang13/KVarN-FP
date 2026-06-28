@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -38,6 +39,11 @@ SCALE_GRANULARITY_ALIASES = {
     "block": "per_block",
     "per_block": "per_block",
 }
+
+
+def default_int4_quantile() -> float:
+    q = float(os.environ.get("KVARN_RTN_QUANTILE", "0.005") or 0.005)
+    return q if 0.0 < q < 0.5 else 0.005
 
 
 def fp4_pow2_scale_exp(absmax: torch.Tensor) -> torch.Tensor:
@@ -143,6 +149,45 @@ def aminmax_for_scale(
     return x.amin(dim=dims, keepdim=True), x.amax(dim=dims, keepdim=True)
 
 
+def quantile_range(
+    x: torch.Tensor, q: float, dims: tuple[int, ...]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not 0.0 < q < 0.5:
+        raise ValueError(f"quantile must be in (0, 0.5), got {q}")
+    dims = tuple(dim if dim >= 0 else x.ndim + dim for dim in dims)
+    keep_dims = tuple(dim for dim in range(x.ndim) if dim not in dims)
+    permuted = x.permute(*keep_dims, *dims)
+    keep_shape = [x.shape[dim] for dim in keep_dims]
+    reduce_numel = math.prod(x.shape[dim] for dim in dims)
+    flattened = permuted.reshape(*keep_shape, reduce_numel)
+    reduce_numel = flattened.shape[-1]
+    lo_k = max(1, min(reduce_numel, math.ceil(q * reduce_numel)))
+    hi_k = max(1, min(reduce_numel, math.ceil((1.0 - q) * reduce_numel)))
+    lo = flattened.kthvalue(lo_k, dim=-1).values
+    hi = flattened.kthvalue(hi_k, dim=-1).values
+    out_shape = [1] * x.ndim
+    for index, dim in enumerate(keep_dims):
+        out_shape[dim] = keep_shape[index]
+    return lo.reshape(out_shape), hi.reshape(out_shape)
+
+
+def quantile_absmax(x: torch.Tensor, q: float, dims: tuple[int, ...]) -> torch.Tensor:
+    if not 0.0 < q < 0.5:
+        raise ValueError(f"quantile must be in (0, 0.5), got {q}")
+    dims = tuple(dim if dim >= 0 else x.ndim + dim for dim in dims)
+    keep_dims = tuple(dim for dim in range(x.ndim) if dim not in dims)
+    permuted = x.abs().permute(*keep_dims, *dims)
+    keep_shape = [x.shape[dim] for dim in keep_dims]
+    reduce_numel = math.prod(x.shape[dim] for dim in dims)
+    flattened = permuted.reshape(*keep_shape, reduce_numel)
+    k = max(1, min(reduce_numel, math.ceil((1.0 - q) * reduce_numel)))
+    absmax = flattened.kthvalue(k, dim=-1).values
+    out_shape = [1] * x.ndim
+    for index, dim in enumerate(keep_dims):
+        out_shape[dim] = keep_shape[index]
+    return absmax.reshape(out_shape)
+
+
 def block_view(x: torch.Tensor, block_size: int) -> torch.Tensor:
     if x.ndim != 3:
         raise ValueError("per_block requires a 3D tensor")
@@ -185,6 +230,7 @@ def quant_int4(
     granularity: str,
     block_size: int,
     quant_scheme: str = "asym",
+    quantile: float | None = None,
 ) -> torch.Tensor:
     granularity = normalize_granularity(granularity)
     if granularity == "per_block":
@@ -202,6 +248,13 @@ def quant_int4(
             scale = ((hi - lo) / qmax).clamp_min(1e-12)
             q = torch.clamp(torch.round((view - lo) / scale), 0, qmax)
             return unblock_view(q * scale + lo, x.shape)
+        if quant_scheme == "asym_quantile":
+            qmax = 15
+            q = 0.005 if quantile is None else quantile
+            lo, hi = quantile_range(view, q, dims=(2, 3))
+            scale = ((hi - lo) / qmax).clamp_min(1e-10)
+            quant = torch.clamp(torch.round((view - lo) / scale), 0, qmax)
+            return unblock_view(quant * scale + lo, x.shape)
         raise ValueError(f"unknown int4 quant scheme: {quant_scheme}")
     if granularity == "per_channel_block":
         view = channel_block_view(x, block_size)
@@ -218,6 +271,13 @@ def quant_int4(
             scale = ((hi - lo) / qmax).clamp_min(1e-12)
             q = torch.clamp(torch.round((view - lo) / scale), 0, qmax)
             return unchannel_block_view(q * scale + lo, x.shape)
+        if quant_scheme == "asym_quantile":
+            qmax = 15
+            q = 0.005 if quantile is None else quantile
+            lo, hi = quantile_range(view, q, dims=(0, 1, 3))
+            scale = ((hi - lo) / qmax).clamp_min(1e-10)
+            quant = torch.clamp(torch.round((view - lo) / scale), 0, qmax)
+            return unchannel_block_view(quant * scale + lo, x.shape)
         raise ValueError(f"unknown int4 quant scheme: {quant_scheme}")
     if quant_scheme == "sym":
         qmax = 7
@@ -230,6 +290,13 @@ def quant_int4(
         scale = ((hi - lo) / qmax).clamp_min(1e-12)
         q = torch.clamp(torch.round((x - lo) / scale), 0, qmax)
         return q * scale + lo
+    if quant_scheme == "asym_quantile":
+        qmax = 15
+        q = 0.005 if quantile is None else quantile
+        lo, hi = quantile_range(x, q, dims=scale_reduce_dims(x, granularity))
+        scale = ((hi - lo) / qmax).clamp_min(1e-10)
+        quant = torch.clamp(torch.round((x - lo) / scale), 0, qmax)
+        return quant * scale + lo
     raise ValueError(f"unknown int4 quant scheme: {quant_scheme}")
 
 
@@ -294,24 +361,37 @@ def quant_int8(
 
 
 def quant_fp4(
-    x: torch.Tensor, granularity: str, scale_dtype: str, block_size: int
+    x: torch.Tensor,
+    granularity: str,
+    scale_dtype: str,
+    block_size: int,
+    quantile: float | None = None,
 ) -> torch.Tensor:
     granularity = normalize_granularity(granularity)
     if granularity == "per_block":
         view = block_view(x, block_size)
-        absmax = view.abs().amax(dim=(2, 3), keepdim=True)
+        if quantile is None:
+            absmax = view.abs().amax(dim=(2, 3), keepdim=True)
+        else:
+            absmax = quantile_absmax(view, quantile, dims=(2, 3))
         scale = compute_fp4_scale(absmax, scale_dtype)
         scaled = view.float() / scale
         q = fp4_e2m1_nearest(scaled)
         return unblock_view((q * scale).to(x.dtype), x.shape)
     if granularity == "per_channel_block":
         view = channel_block_view(x, block_size)
-        absmax = view.abs().amax(dim=(0, 1, 3), keepdim=True)
+        if quantile is None:
+            absmax = view.abs().amax(dim=(0, 1, 3), keepdim=True)
+        else:
+            absmax = quantile_absmax(view, quantile, dims=(0, 1, 3))
         scale = compute_fp4_scale(absmax, scale_dtype)
         scaled = view.float() / scale
         q = fp4_e2m1_nearest(scaled)
         return unchannel_block_view((q * scale).to(x.dtype), x.shape)
-    absmax = absmax_for_scale(x, granularity)
+    if quantile is None:
+        absmax = absmax_for_scale(x, granularity)
+    else:
+        absmax = quantile_absmax(x, quantile, dims=scale_reduce_dims(x, granularity))
     scale = compute_fp4_scale(absmax, scale_dtype)
     scaled = x.float() / scale
     q = fp4_e2m1_nearest(scaled)
@@ -324,25 +404,41 @@ def quant_fp8(
     granularity: str,
     scale_dtype: str,
     block_size: int,
+    quantile: float | None = None,
 ) -> torch.Tensor:
     granularity = normalize_granularity(granularity)
     if granularity == "per_block":
         view = block_view(x, block_size)
-        absmax = view.abs().amax(dim=(2, 3), keepdim=True)
+        if quantile is None:
+            absmax = view.abs().amax(dim=(2, 3), keepdim=True)
+        else:
+            absmax = quantile_absmax(view, quantile, dims=(2, 3))
         scale = compute_scale(absmax, FP8_MAX[value_dtype], scale_dtype)
-        scaled = view.float() / scale
+        scaled = (view.float() / scale).clamp(
+            -FP8_MAX[value_dtype], FP8_MAX[value_dtype]
+        )
         q = scaled.to(fp8_dtype(value_dtype)).float()
         return unblock_view((q * scale).to(x.dtype), x.shape)
     if granularity == "per_channel_block":
         view = channel_block_view(x, block_size)
-        absmax = view.abs().amax(dim=(0, 1, 3), keepdim=True)
+        if quantile is None:
+            absmax = view.abs().amax(dim=(0, 1, 3), keepdim=True)
+        else:
+            absmax = quantile_absmax(view, quantile, dims=(0, 1, 3))
         scale = compute_scale(absmax, FP8_MAX[value_dtype], scale_dtype)
-        scaled = view.float() / scale
+        scaled = (view.float() / scale).clamp(
+            -FP8_MAX[value_dtype], FP8_MAX[value_dtype]
+        )
         q = scaled.to(fp8_dtype(value_dtype)).float()
         return unchannel_block_view((q * scale).to(x.dtype), x.shape)
-    absmax = absmax_for_scale(x, granularity)
+    if quantile is None:
+        absmax = absmax_for_scale(x, granularity)
+    else:
+        absmax = quantile_absmax(x, quantile, dims=scale_reduce_dims(x, granularity))
     scale = compute_scale(absmax, FP8_MAX[value_dtype], scale_dtype)
-    scaled = x.float() / scale
+    scaled = (x.float() / scale).clamp(
+        -FP8_MAX[value_dtype], FP8_MAX[value_dtype]
+    )
     q = scaled.to(fp8_dtype(value_dtype)).float()
     return (q * scale).to(x.dtype)
 
@@ -471,6 +567,18 @@ def print_fp_nan_diagnostics(
     print_tensor_summary(f"{name} output", got)
 
 
+def print_error_nan_diagnostics(
+    name: str, ref: torch.Tensor, got: torch.Tensor
+) -> None:
+    err = got.float() - ref.float()
+    if torch.isfinite(err).all():
+        return
+    print(f"[DEBUG] non-finite error from {name}")
+    print_tensor_summary(f"{name} ref", ref)
+    print_tensor_summary(f"{name} got", got)
+    print_tensor_summary(f"{name} error", err)
+
+
 def make_matrix(args: argparse.Namespace, seed: int) -> torch.Tensor:
     gen = torch.Generator(device=args.device)
     gen.manual_seed(seed)
@@ -587,6 +695,63 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--int4-quantile",
+        type=float,
+        default=default_int4_quantile(),
+        help=(
+            "Quantile q for the KVarN-style int4_asym_quantile baseline, "
+            "using [q, 1-q] instead of min/max."
+        ),
+    )
+    parser.add_argument(
+        "--fp-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated shared quantile q for FP quantile baselines. "
+            "Use --fp4-quantile and --fp8-quantile to tune them separately."
+        ),
+    )
+    parser.add_argument(
+        "--fp4-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Quantile q for FP4 quantile baselines, using abs(x) quantile "
+            "1-q instead of absmax. Defaults to --fp-quantile or 0.005."
+        ),
+    )
+    parser.add_argument(
+        "--fp8-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Quantile q for FP8 quantile baselines, using abs(x) quantile "
+            "1-q instead of absmax. Defaults to --fp-quantile or 0.0001."
+        ),
+    )
+    parser.add_argument(
+        "--fp4-quantile-sweep",
+        default="",
+        help=(
+            "Comma-separated FP4 quantiles to sweep. If set, emits one "
+            "fp4_quantile_q*_scale_* baseline per q."
+        ),
+    )
+    parser.add_argument(
+        "--fp8-quantile-sweep",
+        default="",
+        help=(
+            "Comma-separated FP8 quantiles to sweep. If set, emits one "
+            "fp8_quantile_q*_scale_* baseline per q."
+        ),
+    )
+    parser.add_argument(
+        "--compare-quantile-only",
+        action="store_true",
+        help="Only include quantile FP/INT variants in the pairwise report.",
+    )
+    parser.add_argument(
         "--output-json",
         default="myscript/output/evalscope/profile/matrix_quant_mse.json",
     )
@@ -671,7 +836,7 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
     for granularity in granularities:
         granularity = normalize_granularity(granularity)
         prefix = granularity
-        for int4_scheme in ("sym", "asym"):
+        for int4_scheme in ("sym", "asym", "asym_quantile"):
             results[f"{prefix}_int4_{int4_scheme}"] = metrics(
                 x,
                 quant_int4(
@@ -679,6 +844,7 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
                     granularity,
                     args.block_size,
                     quant_scheme=int4_scheme,
+                    quantile=args.int4_quantile,
                 ),
             )
         results[f"{prefix}_int8_{args.int_quant_scheme}"] = metrics(
@@ -695,6 +861,7 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
             got = quant_fp4(x, granularity, scale_dtype, args.block_size)
             results[name] = metrics(x, got)
             if args.debug_fp_nan_scales:
+                print_error_nan_diagnostics(name, x, got)
                 print_fp_nan_diagnostics(
                     name,
                     x,
@@ -704,10 +871,38 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
                     FP4_E2M1_MAX,
                     scale_dtype,
                 )
+            for q in args.fp4_quantiles:
+                name = fp_quantile_name(
+                    prefix,
+                    "fp4",
+                    scale_dtype,
+                    q,
+                    args.fp4_quantile_use_q_label,
+                )
+                got = quant_fp4(
+                    x,
+                    granularity,
+                    scale_dtype,
+                    args.block_size,
+                    quantile=q,
+                )
+                results[name] = metrics(x, got)
+                if args.debug_fp_nan_scales:
+                    print_error_nan_diagnostics(name, x, got)
+                    print_fp_nan_diagnostics(
+                        name,
+                        x,
+                        got,
+                        granularity,
+                        args.block_size,
+                        FP4_E2M1_MAX,
+                        scale_dtype,
+                    )
             name = f"{prefix}_fp4_zp_scale_{scale_dtype}"
             got = quant_fp4_zp(x, granularity, scale_dtype, args.block_size)
             results[name] = metrics(x, got)
             if args.debug_fp_nan_scales:
+                print_error_nan_diagnostics(name, x, got)
                 print_fp_nan_diagnostics(
                     name,
                     x,
@@ -743,6 +938,7 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
                 )
                 results[name] = metrics(x, got)
                 if args.debug_fp_nan_scales:
+                    print_error_nan_diagnostics(name, x, got)
                     print_fp_nan_diagnostics(
                         name,
                         x,
@@ -752,6 +948,34 @@ def run_once(args: argparse.Namespace, seed: int) -> dict[str, dict[str, float]]
                         FP8_MAX[fp8_value_dtype],
                         scale_dtype,
                     )
+                for q in args.fp8_quantiles:
+                    name = fp_quantile_name(
+                        prefix,
+                        fp8_value_dtype,
+                        scale_dtype,
+                        q,
+                        args.fp8_quantile_use_q_label,
+                    )
+                    got = quant_fp8(
+                        x,
+                        fp8_value_dtype,
+                        granularity,
+                        scale_dtype,
+                        args.block_size,
+                        quantile=q,
+                    )
+                    results[name] = metrics(x, got)
+                    if args.debug_fp_nan_scales:
+                        print_error_nan_diagnostics(name, x, got)
+                        print_fp_nan_diagnostics(
+                            name,
+                            x,
+                            got,
+                            granularity,
+                            args.block_size,
+                            FP8_MAX[fp8_value_dtype],
+                            scale_dtype,
+                        )
     return results
 
 
@@ -777,6 +1001,55 @@ def aggregate_runs(
 
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_float_csv(value: str) -> list[float]:
+    return [float(item) for item in parse_csv(value)]
+
+
+def validate_quantile(name: str, q: float) -> None:
+    if not 0.0 < q < 0.5:
+        raise ValueError(f"{name} must be in (0, 0.5), got {q}")
+
+
+def quantile_label(q: float) -> str:
+    return f"q{q:g}".replace("-", "m").replace(".", "p")
+
+
+def fp_quantile_name(
+    prefix: str,
+    fp_kind: str,
+    scale_dtype: str,
+    q: float,
+    use_q_label: bool,
+) -> str:
+    if use_q_label:
+        return (
+            f"{prefix}_{fp_kind}_quantile_{quantile_label(q)}_scale_"
+            f"{scale_dtype}"
+        )
+    return f"{prefix}_{fp_kind}_quantile_scale_{scale_dtype}"
+
+
+def parse_quantile_label(label: str) -> float:
+    value = label.removeprefix("q").replace("p", ".").replace("m", "-")
+    return float(value)
+
+
+def fp_quantile_from_name(name: str) -> float | None:
+    parts = name.split("_")
+    if "quantile" not in parts:
+        return None
+    index = parts.index("quantile")
+    if index + 1 >= len(parts):
+        return None
+    label = parts[index + 1]
+    if not label.startswith("q"):
+        return None
+    try:
+        return parse_quantile_label(label)
+    except ValueError:
+        return None
 
 
 def winner_from_relative_mse(fp_rel: float, int_rel: float) -> tuple[float, str]:
@@ -805,31 +1078,69 @@ def build_pairwise_report(
         normalize_granularity(item) for item in parse_csv(args.scale_granularities)
     ]
 
+    fp4_kinds = ["fp4", "fp4_zp"]
+    fp4_quantile_kinds = [
+        ("fp4", q, args.fp4_quantile_use_q_label) for q in args.fp4_quantiles
+    ]
+    int4_schemes = ["sym", "asym", "asym_quantile"]
+    if args.compare_quantile_only:
+        fp4_kinds = []
+        int4_schemes = ["asym_quantile"]
+
     for granularity in granularities:
-        for fp_kind, int4_scheme in (("fp4", "sym"), ("fp4_zp", "asym")):
-            int4_name = f"{granularity}_int4_{int4_scheme}"
-            if int4_name not in avg:
-                continue
-            int4_rel = avg[int4_name]["relative_mse"]
-            for scale_dtype in parse_csv(args.scale_dtypes):
-                fp_name = f"{granularity}_{fp_kind}_scale_{scale_dtype}"
-                if fp_name not in avg:
+        for fp_kind in fp4_kinds:
+            for int4_scheme in int4_schemes:
+                int4_name = f"{granularity}_int4_{int4_scheme}"
+                if int4_name not in avg:
                     continue
-                fp_rel = avg[fp_name]["relative_mse"]
-                ratio, winner = winner_from_relative_mse(fp_rel, int4_rel)
-                rows.append(
-                    {
-                        "granularity": granularity,
-                        "bits": 4,
-                        "scale_dtype": scale_dtype,
-                        "fp_name": fp_name,
-                        "int_name": int4_name,
-                        "fp_relative_mse": fp_rel,
-                        "int_relative_mse": int4_rel,
-                        "ratio": ratio,
-                        "winner": winner,
-                    }
-                )
+                int4_rel = avg[int4_name]["relative_mse"]
+                for scale_dtype in parse_csv(args.scale_dtypes):
+                    fp_name = f"{granularity}_{fp_kind}_scale_{scale_dtype}"
+                    if fp_name not in avg:
+                        continue
+                    fp_rel = avg[fp_name]["relative_mse"]
+                    ratio, winner = winner_from_relative_mse(fp_rel, int4_rel)
+                    rows.append(
+                        {
+                            "granularity": granularity,
+                            "bits": 4,
+                            "scale_dtype": scale_dtype,
+                            "fp_name": fp_name,
+                            "int_name": int4_name,
+                            "fp_relative_mse": fp_rel,
+                            "int_relative_mse": int4_rel,
+                            "ratio": ratio,
+                            "winner": winner,
+                        }
+                    )
+
+        for fp_kind, q, use_q_label in fp4_quantile_kinds:
+            for int4_scheme in int4_schemes:
+                int4_name = f"{granularity}_int4_{int4_scheme}"
+                if int4_name not in avg:
+                    continue
+                int4_rel = avg[int4_name]["relative_mse"]
+                for scale_dtype in parse_csv(args.scale_dtypes):
+                    fp_name = fp_quantile_name(
+                        granularity, fp_kind, scale_dtype, q, use_q_label
+                    )
+                    if fp_name not in avg:
+                        continue
+                    fp_rel = avg[fp_name]["relative_mse"]
+                    ratio, winner = winner_from_relative_mse(fp_rel, int4_rel)
+                    rows.append(
+                        {
+                            "granularity": granularity,
+                            "bits": 4,
+                            "scale_dtype": scale_dtype,
+                            "fp_name": fp_name,
+                            "int_name": int4_name,
+                            "fp_relative_mse": fp_rel,
+                            "int_relative_mse": int4_rel,
+                            "ratio": ratio,
+                            "winner": winner,
+                        }
+                    )
 
         for scale_dtype in parse_csv(args.fp8_scale_dtypes):
             int8_name = (
@@ -839,24 +1150,49 @@ def build_pairwise_report(
                 continue
             int8_rel = avg[int8_name]["relative_mse"]
             for fp8_value_dtype in parse_csv(args.fp8_dtypes):
-                fp_name = f"{granularity}_{fp8_value_dtype}_scale_{scale_dtype}"
-                if fp_name not in avg:
-                    continue
-                fp_rel = avg[fp_name]["relative_mse"]
-                ratio, winner = winner_from_relative_mse(fp_rel, int8_rel)
-                rows.append(
-                    {
-                        "granularity": granularity,
-                        "bits": 8,
-                        "scale_dtype": scale_dtype,
-                        "fp_name": fp_name,
-                        "int_name": int8_name,
-                        "fp_relative_mse": fp_rel,
-                        "int_relative_mse": int8_rel,
-                        "ratio": ratio,
-                        "winner": winner,
-                    }
-                )
+                if not args.compare_quantile_only:
+                    fp_name = f"{granularity}_{fp8_value_dtype}_scale_{scale_dtype}"
+                    if fp_name in avg:
+                        fp_rel = avg[fp_name]["relative_mse"]
+                        ratio, winner = winner_from_relative_mse(fp_rel, int8_rel)
+                        rows.append(
+                            {
+                                "granularity": granularity,
+                                "bits": 8,
+                                "scale_dtype": scale_dtype,
+                                "fp_name": fp_name,
+                                "int_name": int8_name,
+                                "fp_relative_mse": fp_rel,
+                                "int_relative_mse": int8_rel,
+                                "ratio": ratio,
+                                "winner": winner,
+                            }
+                        )
+                for q in args.fp8_quantiles:
+                    fp_name = fp_quantile_name(
+                        granularity,
+                        fp8_value_dtype,
+                        scale_dtype,
+                        q,
+                        args.fp8_quantile_use_q_label,
+                    )
+                    if fp_name not in avg:
+                        continue
+                    fp_rel = avg[fp_name]["relative_mse"]
+                    ratio, winner = winner_from_relative_mse(fp_rel, int8_rel)
+                    rows.append(
+                        {
+                            "granularity": granularity,
+                            "bits": 8,
+                            "scale_dtype": scale_dtype,
+                            "fp_name": fp_name,
+                            "int_name": int8_name,
+                            "fp_relative_mse": fp_rel,
+                            "int_relative_mse": int8_rel,
+                            "ratio": ratio,
+                            "winner": winner,
+                        }
+                    )
     return rows
 
 
@@ -889,6 +1225,21 @@ def histogram_values(
     if hist_kind == "signed_error":
         return err.flatten()
     raise ValueError(f"unknown histogram kind: {hist_kind}")
+
+
+def print_histogram_nan_diagnostics(
+    name: str,
+    ref: torch.Tensor,
+    got: torch.Tensor,
+    values: torch.Tensor,
+    hist_kind: str,
+) -> None:
+    err = got.float() - ref.float()
+    print(f"[DEBUG] non-finite {hist_kind} histogram values from {name}")
+    print_tensor_summary(f"{name} ref", ref)
+    print_tensor_summary(f"{name} got", got)
+    print_tensor_summary(f"{name} error", err)
+    print_tensor_summary(f"{name} {hist_kind}", values)
 
 
 def histogram_bins(args: argparse.Namespace) -> torch.Tensor:
@@ -930,11 +1281,15 @@ def infer_value_histogram_max(args: argparse.Namespace, seeds: list[int]) -> flo
 def iter_histogram_quantizers(args: argparse.Namespace):
     for granularity in parse_csv(args.scale_granularities):
         granularity = normalize_granularity(granularity)
-        for int4_scheme in ("sym", "asym"):
+        for int4_scheme in ("sym", "asym", "asym_quantile"):
             yield (
                 f"{granularity}_int4_{int4_scheme}",
                 lambda x, g=granularity, s=int4_scheme: quant_int4(
-                    x, g, args.block_size, quant_scheme=s
+                    x,
+                    g,
+                    args.block_size,
+                    quant_scheme=s,
+                    quantile=args.int4_quantile,
                 ),
             )
         for scale_dtype in parse_csv(args.scale_dtypes):
@@ -944,12 +1299,23 @@ def iter_histogram_quantizers(args: argparse.Namespace):
                     x, g, sd, args.block_size
                 ),
             )
-            yield (
-                f"{granularity}_fp4_zp_scale_{scale_dtype}",
-                lambda x, g=granularity, sd=scale_dtype: quant_fp4_zp(
-                    x, g, sd, args.block_size
-                ),
-            )
+            for q in args.fp4_quantiles:
+                yield (
+                    fp_quantile_name(
+                        granularity,
+                        "fp4",
+                        scale_dtype,
+                        q,
+                        args.fp4_quantile_use_q_label,
+                    ),
+                    lambda x, g=granularity, sd=scale_dtype, q=q: quant_fp4(
+                        x,
+                        g,
+                        sd,
+                        args.block_size,
+                        quantile=q,
+                    ),
+                )
         for scale_dtype in parse_csv(args.fp8_scale_dtypes):
             yield (
                 f"{granularity}_int8_{args.int_quant_scheme}_scale_{scale_dtype}",
@@ -974,6 +1340,33 @@ def iter_histogram_quantizers(args: argparse.Namespace):
                         )
                     ),
                 )
+                for q in args.fp8_quantiles:
+                    def quantizer(
+                        x,
+                        g=granularity,
+                        sd=scale_dtype,
+                        fd=fp8_value_dtype,
+                        q=q,
+                    ):
+                        return quant_fp8(
+                            x,
+                            fd,
+                            g,
+                            sd,
+                            args.block_size,
+                            quantile=q,
+                        )
+
+                    yield (
+                        fp_quantile_name(
+                            granularity,
+                            fp8_value_dtype,
+                            scale_dtype,
+                            q,
+                            args.fp8_quantile_use_q_label,
+                        ),
+                        quantizer,
+                    )
 
 
 def average_histograms(
@@ -1004,6 +1397,20 @@ def average_histograms(
         for name, quantizer in quantizers:
             got = quantizer(x)
             values = histogram_values(x, got, args.histogram_kind)
+            finite = torch.isfinite(values)
+            if not finite.all():
+                bad = values.numel() - int(finite.sum().item())
+                print(
+                    f"[WARN] skipped {bad} non-finite "
+                    f"{args.histogram_kind} histogram values from {name}"
+                )
+                if args.debug_fp_nan_scales:
+                    print_histogram_nan_diagnostics(
+                        name, x, got, values, args.histogram_kind
+                    )
+                values = values[finite]
+                if values.numel() == 0:
+                    continue
             values = values.float().clamp(float(bins[0]), float(bins[-1]))
             bucket = torch.bucketize(values, bins) - 1
             bucket = bucket.clamp(0, args.histogram_bins - 1)
@@ -1122,6 +1529,68 @@ def plot_histogram_comparison_panel(
     print(f"[INFO] wrote histogram {path}")
 
 
+def plot_histogram_overlay_panel(
+    args: argparse.Namespace,
+    bins: torch.Tensor,
+    counts: dict[str, torch.Tensor],
+    names: list[str],
+    title: str,
+    path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    baseline_colors = (
+        ("int4_sym", "black"),
+        ("int4_asym_quantile", "tab:purple"),
+        ("int4_asym", "tab:green"),
+        ("fp4_scale", "dimgray"),
+    )
+    fallback_colors = ("tab:brown", "tab:cyan", "tab:olive", "tab:pink")
+    quantile_values = {
+        name: q for name in names if (q := fp_quantile_from_name(name)) is not None
+    }
+    sorted_quantiles = sorted(set(quantile_values.values()))
+    quantile_index = {q: index for index, q in enumerate(sorted_quantiles)}
+    quantile_cmap = plt.get_cmap("turbo")
+
+    def color_for_name(name: str, fallback_index: int) -> str | tuple[float, ...]:
+        quantile = quantile_values.get(name)
+        if quantile is not None:
+            if len(sorted_quantiles) == 1:
+                return quantile_cmap(0.5)
+            ratio = quantile_index[quantile] / (len(sorted_quantiles) - 1)
+            return quantile_cmap(0.12 + 0.76 * ratio)
+        for pattern, color in baseline_colors:
+            if pattern in name:
+                return color
+        return fallback_colors[fallback_index % len(fallback_colors)]
+
+    fig, ax = plt.subplots(1, 1, figsize=(5.8, 4.8))
+    for index, name in enumerate(names):
+        if name not in counts:
+            continue
+        color = color_for_name(name, index)
+        ax.stairs(
+            counts[name].clamp_min(args.histogram_y_min).numpy(),
+            bins.numpy(),
+            linewidth=1.8,
+            alpha=args.histogram_alpha,
+            label=name,
+            color=color,
+        )
+    if args.histogram_y_scale == "log":
+        ax.set_yscale("log")
+    ax.set_xlabel(args.histogram_kind)
+    ax.set_ylabel("average probability")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    print(f"[INFO] wrote histogram {path}")
+
+
 def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
     try:
         import matplotlib.pyplot  # noqa: F401
@@ -1139,9 +1608,19 @@ def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
             names = [
                 f"{granularity}_int4_sym",
                 f"{granularity}_int4_asym",
+                f"{granularity}_int4_asym_quantile",
                 f"{granularity}_fp4_scale_{scale_dtype}",
-                f"{granularity}_fp4_zp_scale_{scale_dtype}",
             ]
+            names.extend(
+                fp_quantile_name(
+                    granularity,
+                    "fp4",
+                    scale_dtype,
+                    q,
+                    args.fp4_quantile_use_q_label,
+                )
+                for q in args.fp4_quantiles
+            )
             path = (
                 output_dir
                 / (
@@ -1150,21 +1629,11 @@ def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
                 )
             )
             if args.histogram_kind == "signed_error":
-                pairs = [
-                    (
-                        f"{granularity}_int4_sym",
-                        f"{granularity}_fp4_scale_{scale_dtype}",
-                    ),
-                    (
-                        f"{granularity}_int4_asym",
-                        f"{granularity}_fp4_zp_scale_{scale_dtype}",
-                    ),
-                ]
-                plot_histogram_comparison_panel(
+                plot_histogram_overlay_panel(
                     args,
                     bins,
                     counts,
-                    pairs,
+                    names,
                     f"{granularity} 4-bit scale={scale_dtype}",
                     path,
                 )
@@ -1187,6 +1656,17 @@ def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
                 f"{granularity}_{fp8_name}_scale_{scale_dtype}"
                 for fp8_name in parse_csv(args.fp8_dtypes)
             )
+            names.extend(
+                fp_quantile_name(
+                    granularity,
+                    fp8_name,
+                    scale_dtype,
+                    q,
+                    args.fp8_quantile_use_q_label,
+                )
+                for fp8_name in parse_csv(args.fp8_dtypes)
+                for q in args.fp8_quantiles
+            )
             path = (
                 output_dir
                 / (
@@ -1205,6 +1685,23 @@ def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
                     )
                     for fp8_name in parse_csv(args.fp8_dtypes)
                 ]
+                pairs.extend(
+                    (
+                        (
+                            f"{granularity}_int8_{args.int_quant_scheme}_scale_"
+                            f"{scale_dtype}"
+                        ),
+                        fp_quantile_name(
+                            granularity,
+                            fp8_name,
+                            scale_dtype,
+                            q,
+                            args.fp8_quantile_use_q_label,
+                        ),
+                    )
+                    for fp8_name in parse_csv(args.fp8_dtypes)
+                    for q in args.fp8_quantiles
+                )
                 plot_histogram_comparison_panel(
                     args,
                     bins,
@@ -1227,6 +1724,35 @@ def plot_average_histograms(args: argparse.Namespace, seeds: list[int]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.fp4_quantile is None:
+        args.fp4_quantile = (
+            args.fp_quantile if args.fp_quantile is not None else 0.005
+        )
+    if args.fp8_quantile is None:
+        args.fp8_quantile = (
+            args.fp_quantile if args.fp_quantile is not None else 0.0001
+        )
+    validate_quantile("--int4-quantile", args.int4_quantile)
+    if args.fp_quantile is not None:
+        validate_quantile("--fp-quantile", args.fp_quantile)
+    validate_quantile("--fp4-quantile", args.fp4_quantile)
+    validate_quantile("--fp8-quantile", args.fp8_quantile)
+    args.fp4_quantiles = (
+        parse_float_csv(args.fp4_quantile_sweep)
+        if args.fp4_quantile_sweep
+        else [args.fp4_quantile]
+    )
+    args.fp8_quantiles = (
+        parse_float_csv(args.fp8_quantile_sweep)
+        if args.fp8_quantile_sweep
+        else [args.fp8_quantile]
+    )
+    for q in args.fp4_quantiles:
+        validate_quantile("--fp4-quantile-sweep", q)
+    for q in args.fp8_quantiles:
+        validate_quantile("--fp8-quantile-sweep", q)
+    args.fp4_quantile_use_q_label = len(args.fp4_quantiles) > 1
+    args.fp8_quantile_use_q_label = len(args.fp8_quantiles) > 1
     seeds = list(range(args.seed, args.seed + args.num_seeds))
     runs = [run_once(args, seed) for seed in seeds]
     aggregate = aggregate_runs(runs)
